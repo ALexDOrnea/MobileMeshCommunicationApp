@@ -1,88 +1,47 @@
 import 'dart:async';
 import 'dart:convert';
-
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 
+// --- CONSTANTE UUID ---
 const String kServiceUuid = "12345678-1234-1234-1234-1234567890ab";
-const String kTxCharacteristicUuid =
-    "12345678-1234-1234-1234-1234567890ac"; // write
-const String kRxCharacteristicUuid =
-    "12345678-1234-1234-1234-1234567890ad"; // notify
+const String kTxCharacteristicUuid = "12345678-1234-1234-1234-1234567890ac";
+const String kRxCharacteristicUuid = "12345678-1234-1234-1234-1234567890ad";
 
-void main() {
-  runApp(const MeshChatApp());
-}
-
-class MeshChatApp extends StatelessWidget {
-  const MeshChatApp({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'BLE Chat Draft',
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
-      home: const ChatListPage(),
-    );
-  }
-}
-
-class ChatThread {
-  final String id;
-  final String title;
-  final String? deviceId;
-  bool persistent;
-  List<ChatMessage> messages;
-
-  ChatThread({
-    required this.id,
-    required this.title,
-    required this.deviceId,
-    required this.persistent,
-    required this.messages,
-  });
-
-  Map<String, dynamic> toJson() => {
-    'id': id,
-    'title': title,
-    'deviceId': deviceId,
-    'persistent': persistent,
-    'messages': messages.map((e) => e.toJson()).toList(),
-  };
-
-  factory ChatThread.fromJson(Map<String, dynamic> json) => ChatThread(
-    id: json['id'],
-    title: json['title'],
-    deviceId: json['deviceId'],
-    persistent: json['persistent'] ?? false,
-    messages: (json['messages'] as List<dynamic>? ?? [])
-        .map((e) => ChatMessage.fromJson(Map<String, dynamic>.from(e)))
-        .toList(),
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  runApp(
+    ChangeNotifierProvider(
+      create: (_) => SettingsProvider(prefs),
+      child: const MeshChatApp(),
+    ),
   );
 }
 
+// --- MODELE DE DATE ---
 class ChatMessage {
   final String id;
   final String text;
   final bool isMine;
   final DateTime timestamp;
-
   ChatMessage({
     required this.id,
     required this.text,
     required this.isMine,
     required this.timestamp,
   });
-
   Map<String, dynamic> toJson() => {
     'id': id,
     'text': text,
     'isMine': isMine,
     'timestamp': timestamp.toIso8601String(),
   };
-
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
     id: json['id'],
     text: json['text'],
@@ -91,618 +50,679 @@ class ChatMessage {
   );
 }
 
-class LocalStore {
-  static const _threadsKey = 'chat_threads';
-
-  static Future<List<ChatThread>> loadThreads() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_threadsKey);
-    if (raw == null || raw.isEmpty) return [];
-    final decoded = jsonDecode(raw) as List<dynamic>;
-    return decoded
-        .map((e) => ChatThread.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
-  }
-
-  static Future<void> saveThreads(List<ChatThread> threads) async {
-    final prefs = await SharedPreferences.getInstance();
-    final data = jsonEncode(threads.map((e) => e.toJson()).toList());
-    await prefs.setString(_threadsKey, data);
-  }
+class ChatThread {
+  final String id;
+  final String title;
+  final String? deviceId;
+  List<ChatMessage> messages;
+  ChatThread({
+    required this.id,
+    required this.title,
+    this.deviceId,
+    required this.messages,
+  });
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'deviceId': deviceId,
+    'messages': messages.map((e) => e.toJson()).toList(),
+  };
+  factory ChatThread.fromJson(Map<String, dynamic> json) => ChatThread(
+    id: json['id'],
+    title: json['title'],
+    deviceId: json['deviceId'],
+    messages: (json['messages'] as List)
+        .map((e) => ChatMessage.fromJson(e))
+        .toList(),
+  );
 }
 
-class BleChatService {
-  BluetoothDevice? _device;
-  BluetoothCharacteristic? _txCharacteristic;
-  BluetoothCharacteristic? _rxCharacteristic;
-  StreamSubscription<List<int>>? _notifySub;
-
-  final _incomingController = StreamController<String>.broadcast();
-  final _connectionStateController = StreamController<bool>.broadcast();
-
-  Stream<String> get incomingMessages => _incomingController.stream;
-  Stream<bool> get connectionState => _connectionStateController.stream;
-
-  BluetoothDevice? get device => _device;
-
-  Future<void> connectToDevice(BluetoothDevice device) async {
-    _device = device;
-
-    await device.connect(timeout: const Duration(seconds: 12));
-
-    final services = await device.discoverServices();
-    BluetoothCharacteristic? tx;
-    BluetoothCharacteristic? rx;
-
-    for (final service in services) {
-      if (service.uuid.str128.toLowerCase() == kServiceUuid.toLowerCase()) {
-        for (final c in service.characteristics) {
-          final uuid = c.uuid.str128.toLowerCase();
-          if (uuid == kTxCharacteristicUuid.toLowerCase()) {
-            tx = c;
-          }
-          if (uuid == kRxCharacteristicUuid.toLowerCase()) {
-            rx = c;
-          }
-        }
-      }
-    }
-
-    if (tx == null || rx == null) {
-      throw Exception('Nu am găsit caracteristicile BLE necesare.');
-    }
-
-    _txCharacteristic = tx;
-    _rxCharacteristic = rx;
-
-    await _rxCharacteristic!.setNotifyValue(true);
-    _notifySub?.cancel();
-    _notifySub = _rxCharacteristic!.lastValueStream.listen((value) {
-      if (value.isEmpty) return;
-      final text = utf8.decode(value, allowMalformed: true);
-      _incomingController.add(text);
-    });
-
-    _connectionStateController.add(true);
-  }
-
-  Future<void> sendMessage(String message) async {
-    final tx = _txCharacteristic;
-    if (tx == null) {
-      throw Exception('Nu există conexiune BLE activă.');
-    }
-
-    final bytes = utf8.encode(message);
-    await tx.write(bytes, withoutResponse: false);
-  }
-
-  Future<void> disconnect() async {
-    await _notifySub?.cancel();
-    _notifySub = null;
-
-    try {
-      await _device?.disconnect();
-    } catch (_) {}
-
-    _device = null;
-    _txCharacteristic = null;
-    _rxCharacteristic = null;
-    _connectionStateController.add(false);
-  }
-
-  void dispose() {
-    _notifySub?.cancel();
-    _incomingController.close();
-    _connectionStateController.close();
-  }
-}
-
-class ChatListPage extends StatefulWidget {
-  const ChatListPage({super.key});
-
-  @override
-  State<ChatListPage> createState() => _ChatListPageState();
-}
-
-class _ChatListPageState extends State<ChatListPage> {
-  final _uuid = const Uuid();
+// --- PROVIDER SETĂRI ---
+class SettingsProvider extends ChangeNotifier {
+  final SharedPreferences _prefs;
+  bool _isDarkMode = true;
+  bool _saveHistory = true;
+  Color _accentColor = const Color(0xFF0052D4);
   List<ChatThread> _threads = [];
-  bool _loading = true;
 
+  SettingsProvider(this._prefs) {
+    _isDarkMode = _prefs.getBool('dark_mode') ?? true;
+    _saveHistory = _prefs.getBool('save_history') ?? true;
+    _accentColor = Color(_prefs.getInt('accent_color') ?? 0xFF0052D4);
+    _loadThreads();
+  }
+
+  bool get isDarkMode => _isDarkMode;
+  bool get saveHistory => _saveHistory;
+  Color get accentColor => _accentColor;
+  List<ChatThread> get threads => _threads;
+
+  void toggleTheme(bool val) {
+    _isDarkMode = val;
+    _prefs.setBool('dark_mode', val);
+    notifyListeners();
+  }
+
+  void toggleSaveHistory(bool val) {
+    _saveHistory = val;
+    _prefs.setBool('save_history', val);
+    notifyListeners();
+  }
+
+  void updateAccent(Color c) {
+    _accentColor = c;
+    _prefs.setInt('accent_color', c.value);
+    notifyListeners();
+  }
+
+  void _loadThreads() {
+    final raw = _prefs.getString('chat_threads');
+    if (raw != null) {
+      final List decoded = jsonDecode(raw);
+      _threads = decoded.map((e) => ChatThread.fromJson(e)).toList();
+      notifyListeners();
+    }
+  }
+
+  void saveThread(ChatThread thread) {
+    if (!_saveHistory) return;
+    _threads.removeWhere((t) => t.id == thread.id);
+    _threads.insert(0, thread);
+    _prefs.setString(
+      'chat_threads',
+      jsonEncode(_threads.map((e) => e.toJson()).toList()),
+    );
+    notifyListeners();
+  }
+
+  void clearChats() {
+    _threads.clear();
+    _prefs.remove('chat_threads');
+    notifyListeners();
+  }
+}
+
+// --- APP ENTRY ---
+class MeshChatApp extends StatelessWidget {
+  const MeshChatApp({super.key});
   @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    final threads = await LocalStore.loadThreads();
-    setState(() {
-      _threads = threads;
-      _loading = false;
-    });
-  }
-
-  Future<void> _persist() async {
-    final threadsToSave = _threads
-        .where((t) => t.persistent)
-        .map((t) => t)
-        .toList();
-    await LocalStore.saveThreads(threadsToSave);
-  }
-
-  Future<void> _createManualChat() async {
-    final thread = ChatThread(
-      id: _uuid.v4(),
-      title: 'Chat local',
-      deviceId: null,
-      persistent: false,
-      messages: [],
+  Widget build(BuildContext context) {
+    final settings = Provider.of<SettingsProvider>(context);
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      themeMode: settings.isDarkMode ? ThemeMode.dark : ThemeMode.light,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: settings.accentColor,
+        brightness: Brightness.light,
+      ),
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorSchemeSeed: settings.accentColor,
+        scaffoldBackgroundColor: const Color(0xFF0F1115),
+      ),
+      home: const MainShell(),
     );
-    setState(() => _threads.insert(0, thread));
-    await _persist();
   }
+}
 
-  Future<void> _openScanner() async {
-    final result = await Navigator.push<ChatThread>(
-      context,
-      MaterialPageRoute(builder: (_) => const DeviceScannerPage()),
-    );
+// --- NAVIGARE ---
+class MainShell extends StatefulWidget {
+  const MainShell({super.key});
+  @override
+  State<MainShell> createState() => _MainShellState();
+}
 
-    if (result != null) {
-      setState(() {
-        _threads.removeWhere((t) => t.id == result.id);
-        _threads.insert(0, result);
-      });
-      await _persist();
-    }
-  }
-
-  Future<void> _deleteThread(ChatThread thread) async {
-    setState(() {
-      _threads.removeWhere((t) => t.id == thread.id);
-    });
-    await _persist();
-  }
-
-  Future<void> _togglePersistence(ChatThread thread, bool value) async {
-    setState(() {
-      thread.persistent = value;
-    });
-    await _persist();
-  }
-
-  Future<void> _openThread(ChatThread thread) async {
-    final updated = await Navigator.push<ChatThread>(
-      context,
-      MaterialPageRoute(builder: (_) => ChatRoomPage(initialThread: thread)),
-    );
-
-    if (updated != null) {
-      final index = _threads.indexWhere((t) => t.id == updated.id);
-      if (index != -1) {
-        setState(() {
-          _threads[index] = updated;
-        });
-        await _persist();
-      }
-    }
-  }
-
+class _MainShellState extends State<MainShell> {
+  int _idx = 1;
+  final PageController _pageController = PageController(initialPage: 1);
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Chat-uri BLE'),
-        actions: [
-          IconButton(
-            onPressed: _openScanner,
-            icon: const Icon(Icons.bluetooth_searching),
-            tooltip: 'Scanează device-uri',
+      body: PageView(
+        controller: _pageController,
+        onPageChanged: (i) => setState(() => _idx = i),
+        children: [
+          const DeviceScannerPage(),
+          ChatListPage(
+            onNewChatPressed: () => _pageController.animateToPage(
+              0,
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeInOut,
+            ),
           ),
-          IconButton(
-            onPressed: _createManualChat,
-            icon: const Icon(Icons.add_comment_outlined),
-            tooltip: 'Chat local',
-          ),
+          const SettingsPage(),
         ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _threads.isEmpty
-          ? const Center(
-              child: Text('Nu există chat-uri. Scanează un device BLE.'),
-            )
-          : ListView.builder(
-              itemCount: _threads.length,
-              itemBuilder: (_, index) {
-                final thread = _threads[index];
-                final last = thread.messages.isNotEmpty
-                    ? thread.messages.last.text
-                    : 'Fără mesaje';
-                return Dismissible(
-                  key: ValueKey(thread.id),
-                  background: Container(color: Colors.red),
-                  onDismissed: (_) => _deleteThread(thread),
-                  child: ListTile(
-                    title: Text(thread.title),
-                    subtitle: Text(
-                      last,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    leading: const Icon(Icons.chat_bubble_outline),
-                    trailing: Switch(
-                      value: thread.persistent,
-                      onChanged: (v) => _togglePersistence(thread, v),
-                    ),
-                    onTap: () => _openThread(thread),
-                  ),
-                );
-              },
-            ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openScanner,
-        icon: const Icon(Icons.search),
-        label: const Text('Scan BLE'),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _idx,
+        onTap: (i) => _pageController.animateToPage(
+          i,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeInOut,
+        ),
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.fullscreen_exit),
+            label: 'Scan',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.chat_bubble_outline),
+            label: 'Chats',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings_outlined),
+            label: 'Settings',
+          ),
+        ],
       ),
     );
   }
 }
 
+// --- CHAT LIST ---
+class ChatListPage extends StatelessWidget {
+  final VoidCallback onNewChatPressed;
+  const ChatListPage({super.key, required this.onNewChatPressed});
+  @override
+  Widget build(BuildContext context) {
+    final settings = Provider.of<SettingsProvider>(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('MeshChat'),
+        actions: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Text(
+                '• ${settings.threads.length} active',
+                style: const TextStyle(color: Colors.green, fontSize: 12),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Column(
+              children: [
+                TextField(
+                  decoration: InputDecoration(
+                    hintText: 'Search chats...',
+                    prefixIcon: const Icon(Icons.search),
+                    filled: true,
+                    fillColor: Theme.of(context).cardColor,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: settings.threads.length,
+                    itemBuilder: (context, i) {
+                      final t = settings.threads[i];
+                      return ListTile(
+                        leading: CircleAvatar(
+                          backgroundColor: settings.accentColor,
+                          child: Text(
+                            t.title.isNotEmpty ? t.title[0] : "?",
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                        title: Text(t.title),
+                        subtitle: Text(
+                          t.messages.isNotEmpty
+                              ? t.messages.last.text
+                              : "No messages",
+                          maxLines: 1,
+                        ),
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => ModernChatRoom(thread: t),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Positioned(
+            bottom: 20,
+            left: 20,
+            right: 20,
+            child: ElevatedButton(
+              onPressed: onNewChatPressed,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: settings.accentColor,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(double.infinity, 50),
+              ),
+              child: const Text('+ New Chat'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- SCAN PAGE ---
 class DeviceScannerPage extends StatefulWidget {
   const DeviceScannerPage({super.key});
-
   @override
   State<DeviceScannerPage> createState() => _DeviceScannerPageState();
 }
 
 class _DeviceScannerPageState extends State<DeviceScannerPage> {
-  final _uuid = const Uuid();
-  StreamSubscription<List<ScanResult>>? _scanSub;
-  final Map<String, ScanResult> _results = {};
-  bool _isScanning = false;
+  List<ScanResult> _allResults = [];
+  List<ScanResult> _filteredResults = [];
+  bool _isScan = false;
+  final TextEditingController _searchController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _startScan();
+    _searchController.addListener(_filterDevices);
+    _startAdvertising();
   }
 
-  Future<void> _startScan() async {
-    setState(() => _isScanning = true);
-
-    _scanSub?.cancel();
-    _results.clear();
-
-    _scanSub = FlutterBluePlus.scanResults.listen((results) {
-      for (final r in results) {
-        _results[r.device.remoteId.str] = r;
-      }
-      if (mounted) setState(() {});
-    });
-
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
-    await Future.delayed(const Duration(seconds: 8));
-    if (mounted) {
-      setState(() => _isScanning = false);
-    }
-  }
-
-  Future<void> _stopScan() async {
-    await FlutterBluePlus.stopScan();
-    await _scanSub?.cancel();
-    _scanSub = null;
-    if (mounted) {
-      setState(() => _isScanning = false);
-    }
-  }
-
-  @override
-  void dispose() {
-    _stopScan();
-    super.dispose();
-  }
-
-  String _displayName(ScanResult r) {
-    final p = r.device.platformName.trim();
-    if (p.isNotEmpty) return p;
-    final a = r.advertisementData.advName.trim();
-    if (a.isNotEmpty) return a;
-    return 'Unknown device';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final list = _results.values.toList();
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('BLE devices'),
-        actions: [
-          IconButton(
-            onPressed: _isScanning ? null : _startScan,
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          if (_isScanning) const LinearProgressIndicator(),
-          Expanded(
-            child: list.isEmpty
-                ? const Center(child: Text('Niciun device găsit încă'))
-                : ListView.separated(
-                    itemCount: list.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (_, index) {
-                      final result = list[index];
-                      final name = _displayName(result);
-                      return ListTile(
-                        leading: const Icon(Icons.bluetooth),
-                        title: Text(name),
-                        subtitle: Text(result.device.remoteId.str),
-                        trailing: Text('RSSI ${result.rssi}'),
-                        onTap: () {
-                          final thread = ChatThread(
-                            id: _uuid.v4(),
-                            title: name,
-                            deviceId: result.device.remoteId.str,
-                            persistent: false,
-                            messages: [],
-                          );
-                          Navigator.pop(context, thread);
-                        },
-                      );
-                    },
-                  ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class ChatRoomPage extends StatefulWidget {
-  final ChatThread initialThread;
-
-  const ChatRoomPage({super.key, required this.initialThread});
-
-  @override
-  State<ChatRoomPage> createState() => _ChatRoomPageState();
-}
-
-class _ChatRoomPageState extends State<ChatRoomPage> {
-  late ChatThread _thread;
-  final _controller = TextEditingController();
-  final _uuid = const Uuid();
-  final _ble = BleChatService();
-
-  bool _connecting = false;
-  bool _connected = false;
-  StreamSubscription<String>? _incomingSub;
-  StreamSubscription<bool>? _stateSub;
-
-  @override
-  void initState() {
-    super.initState();
-    _thread = ChatThread(
-      id: widget.initialThread.id,
-      title: widget.initialThread.title,
-      deviceId: widget.initialThread.deviceId,
-      persistent: widget.initialThread.persistent,
-      messages: [...widget.initialThread.messages],
+  // FUNCȚIA MODIFICATĂ PENTRU VIZIBILITATE MAXIMĂ
+  void _startAdvertising() async {
+    final AdvertiseData advertiseData = AdvertiseData(
+      serviceUuid: kServiceUuid,
+      localName: "MeshChat-Node",
     );
 
-    _incomingSub = _ble.incomingMessages.listen((message) {
-      setState(() {
-        _thread.messages.add(
-          ChatMessage(
-            id: _uuid.v4(),
-            text: message,
-            isMine: false,
-            timestamp: DateTime.now(),
-          ),
+    final AdvertiseSettings advertiseSettings = AdvertiseSettings(
+      advertiseMode: AdvertiseMode.advertiseModeLowLatency,
+      txPowerLevel: AdvertiseTxPower.advertiseTxPowerHigh,
+      connectable: true, // ACEASTA PERMITE CONECTAREA
+    );
+
+    try {
+      if (await FlutterBlePeripheral().isSupported) {
+        await FlutterBlePeripheral().start(
+          advertiseData: advertiseData,
+          advertiseSettings: advertiseSettings,
         );
-      });
-    });
+        debugPrint("Advertising pornit!");
+      }
+    } catch (e) {
+      debugPrint("Eroare Advertising: $e");
+    }
+  }
 
-    _stateSub = _ble.connectionState.listen((state) {
+  void _filterDevices() {
+    final query = _searchController.text.toLowerCase();
+    setState(() {
+      _filteredResults = _allResults.where((r) {
+        final name =
+            (r.device.platformName.isEmpty
+                    ? r.advertisementData.advName
+                    : r.device.platformName)
+                .toLowerCase();
+        return name.contains(query) ||
+            r.device.remoteId.str.toLowerCase().contains(query);
+      }).toList();
+    });
+  }
+
+  void _start() async {
+    if (await FlutterBluePlus.isSupported == false) return;
+    if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text("Porniți Bluetooth!")));
+      return;
+    }
+    setState(() {
+      _allResults.clear();
+      _filteredResults.clear();
+      _isScan = true;
+    });
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+    FlutterBluePlus.scanResults.listen((results) {
       if (mounted) {
         setState(() {
-          _connected = state;
+          _allResults = results
+              .where(
+                (r) =>
+                    r.device.platformName.isNotEmpty ||
+                    r.advertisementData.advName.isNotEmpty,
+              )
+              .toList();
+          _filterDevices();
         });
       }
     });
-  }
-
-  Future<void> _connect() async {
-    if (_thread.deviceId == null) return;
-
-    setState(() => _connecting = true);
-    try {
-      final bonded = FlutterBluePlus.connectedDevices;
-      BluetoothDevice? device;
-
-      for (final d in bonded) {
-        if (d.remoteId.str == _thread.deviceId) {
-          device = d;
-          break;
-        }
-      }
-
-      device ??= BluetoothDevice.fromId(_thread.deviceId!);
-
-      await _ble.connectToDevice(device);
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Conectat')));
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Eroare conectare: $e')));
-      }
-    } finally {
-      if (mounted) setState(() => _connecting = false);
-    }
-  }
-
-  Future<void> _disconnect() async {
-    await _ble.disconnect();
-  }
-
-  Future<void> _send() async {
-    final text = _controller.text.trim();
-    if (text.isEmpty) return;
-
-    setState(() {
-      _thread.messages.add(
-        ChatMessage(
-          id: _uuid.v4(),
-          text: text,
-          isMine: true,
-          timestamp: DateTime.now(),
-        ),
-      );
-    });
-
-    _controller.clear();
-
-    try {
-      await _ble.sendMessage(text);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Trimiterea a eșuat: $e')));
-      }
-    }
-  }
-
-  Future<bool> _onWillPop() async {
-    Navigator.pop(context, _thread);
-    return false;
+    await Future.delayed(const Duration(seconds: 10));
+    if (mounted) setState(() => _isScan = false);
   }
 
   @override
   void dispose() {
-    _incomingSub?.cancel();
-    _stateSub?.cancel();
-    _ble.dispose();
-    _controller.dispose();
+    _searchController.dispose();
+    FlutterBlePeripheral().stop();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      onPopInvoked: (_) async => _onWillPop(),
-      child: Scaffold(
-        appBar: AppBar(
-          title: Text(_thread.title),
-          actions: [
-            Row(
-              children: [
-                const Text('Salvează'),
-                Switch(
-                  value: _thread.persistent,
-                  onChanged: (v) => setState(() => _thread.persistent = v),
-                ),
-              ],
-            ),
-            if (_thread.deviceId != null)
-              IconButton(
-                onPressed: _connected
-                    ? _disconnect
-                    : (_connecting ? null : _connect),
-                icon: Icon(_connected ? Icons.link_off : Icons.link),
-              ),
-          ],
-        ),
-        body: Column(
+    return Scaffold(
+      appBar: AppBar(title: const Text('Scan Devices')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
           children: [
-            Material(
-              color: Colors.black12,
-              child: ListTile(
-                leading: Icon(
-                  _connected
-                      ? Icons.bluetooth_connected
-                      : Icons.bluetooth_disabled,
-                ),
-                title: Text(_thread.deviceId ?? 'Chat fără device BLE'),
-                subtitle: Text(
-                  _connected
-                      ? 'Conectat'
-                      : (_connecting ? 'Se conectează...' : 'Neconectat'),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _isScan ? null : _start,
+                icon: const Icon(Icons.sync),
+                label: Text(_isScan ? 'Scanning...' : 'Scan for Devices'),
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _searchController,
+              decoration: InputDecoration(
+                hintText: 'Search...',
+                prefixIcon: const Icon(Icons.search),
+                filled: true,
+                fillColor: Theme.of(context).cardColor,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide.none,
                 ),
               ),
             ),
+            const SizedBox(height: 10),
             Expanded(
               child: ListView.builder(
-                padding: const EdgeInsets.all(12),
-                itemCount: _thread.messages.length,
-                itemBuilder: (_, index) {
-                  final m = _thread.messages[index];
-                  return Align(
-                    alignment: m.isMine
-                        ? Alignment.centerRight
-                        : Alignment.centerLeft,
-                    child: Container(
-                      margin: const EdgeInsets.symmetric(vertical: 4),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                      constraints: const BoxConstraints(maxWidth: 280),
-                      decoration: BoxDecoration(
-                        color: m.isMine
-                            ? Colors.blue.shade100
-                            : Colors.grey.shade300,
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(m.text),
-                          const SizedBox(height: 4),
-                          Text(
-                            '${m.timestamp.hour.toString().padLeft(2, '0')}:${m.timestamp.minute.toString().padLeft(2, '0')}',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ],
+                itemCount: _filteredResults.length,
+                itemBuilder: (context, i) {
+                  final r = _filteredResults[i];
+                  final name = r.device.platformName.isNotEmpty
+                      ? r.device.platformName
+                      : r.advertisementData.advName;
+                  return Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.bluetooth, color: Colors.green),
+                      title: Text(name),
+                      subtitle: Text(r.device.remoteId.str),
+                      trailing: ElevatedButton(
+                        onPressed: () {
+                          final newThread = ChatThread(
+                            id: const Uuid().v4(),
+                            title: name,
+                            deviceId: r.device.remoteId.str,
+                            messages: [],
+                          );
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => ModernChatRoom(
+                                thread: newThread,
+                                device: r.device,
+                              ),
+                            ),
+                          );
+                        },
+                        child: const Text("Connect"),
                       ),
                     ),
                   );
                 },
               ),
             ),
-            SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _controller,
-                        decoration: const InputDecoration(
-                          hintText: 'Mesaj',
-                          border: OutlineInputBorder(),
-                        ),
-                        onSubmitted: (_) => _send(),
-                      ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// --- CHAT ROOM ---
+class ModernChatRoom extends StatefulWidget {
+  final ChatThread thread;
+  final BluetoothDevice? device;
+  const ModernChatRoom({super.key, required this.thread, this.device});
+  @override
+  State<ModernChatRoom> createState() => _ModernChatRoomState();
+}
+
+class _ModernChatRoomState extends State<ModernChatRoom> {
+  final _msgController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  BluetoothCharacteristic? _tx;
+  StreamSubscription? _rxSub;
+  bool _isConnected = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.device != null) _connect();
+  }
+
+  void _connect() async {
+    try {
+      await widget.device!.connect();
+      setState(() => _isConnected = true);
+      final services = await widget.device!.discoverServices();
+      for (var s in services) {
+        if (s.uuid.str128.toLowerCase() == kServiceUuid) {
+          for (var c in s.characteristics) {
+            if (c.uuid.str128.toLowerCase() == kTxCharacteristicUuid) _tx = c;
+            if (c.uuid.str128.toLowerCase() == kRxCharacteristicUuid) {
+              await c.setNotifyValue(true);
+              _rxSub = c.lastValueStream.listen((val) {
+                if (val.isEmpty) return;
+                setState(() {
+                  widget.thread.messages.add(
+                    ChatMessage(
+                      id: const Uuid().v4(),
+                      text: utf8.decode(val),
+                      isMine: false,
+                      timestamp: DateTime.now(),
                     ),
-                    const SizedBox(width: 8),
-                    IconButton(onPressed: _send, icon: const Icon(Icons.send)),
-                  ],
-                ),
-              ),
+                  );
+                });
+                _scrollToBottom();
+                Provider.of<SettingsProvider>(
+                  context,
+                  listen: false,
+                ).saveThread(widget.thread);
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint("Eroare conexiune: $e");
+    }
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients)
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+    });
+  }
+
+  void _send() async {
+    if (_msgController.text.trim().isEmpty) return;
+    final txt = _msgController.text.trim();
+    setState(() {
+      widget.thread.messages.add(
+        ChatMessage(
+          id: const Uuid().v4(),
+          text: txt,
+          isMine: true,
+          timestamp: DateTime.now(),
+        ),
+      );
+    });
+    _scrollToBottom();
+    if (_tx != null) {
+      try {
+        await _tx!.write(utf8.encode(txt));
+      } catch (e) {
+        debugPrint("Eroare send: $e");
+      }
+    }
+    _msgController.clear();
+    Provider.of<SettingsProvider>(
+      context,
+      listen: false,
+    ).saveThread(widget.thread);
+  }
+
+  @override
+  void dispose() {
+    _rxSub?.cancel();
+    _msgController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(widget.thread.title),
+            Text(
+              _isConnected ? "Conectat" : "Deconectat",
+              style: const TextStyle(fontSize: 12),
             ),
           ],
         ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              controller: _scrollController,
+              itemCount: widget.thread.messages.length,
+              itemBuilder: (context, i) {
+                final m = widget.thread.messages[i];
+                return Align(
+                  alignment: m.isMine
+                      ? Alignment.centerRight
+                      : Alignment.centerLeft,
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: m.isMine
+                          ? Theme.of(context).colorScheme.primary
+                          : Theme.of(context).cardColor,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      m.text,
+                      style: TextStyle(color: m.isMine ? Colors.white : null),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _msgController,
+                    decoration: const InputDecoration(hintText: "Mesaj..."),
+                  ),
+                ),
+                IconButton(onPressed: _send, icon: const Icon(Icons.send)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- SETTINGS ---
+class SettingsPage extends StatelessWidget {
+  const SettingsPage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    final s = Provider.of<SettingsProvider>(context);
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          ListTile(
+            leading: CircleAvatar(
+              backgroundColor: s.accentColor,
+              child: const Text('ME'),
+            ),
+            title: const Text('My Device'),
+            subtitle: Text(Platform.isAndroid ? "Android Node" : "iOS Node"),
+          ),
+          SwitchListTile(
+            title: const Text("Save History"),
+            value: s.saveHistory,
+            onChanged: (v) => s.toggleSaveHistory(v),
+          ),
+          ListTile(
+            leading: const Icon(Icons.delete, color: Colors.red),
+            title: const Text("Clear Chats"),
+            onTap: () => s.clearChats(),
+          ),
+          SwitchListTile(
+            title: const Text("Dark Mode"),
+            value: s.isDarkMode,
+            onChanged: (v) => s.toggleTheme(v),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children:
+                [
+                      Colors.blue,
+                      Colors.purple,
+                      Colors.green,
+                      Colors.orange,
+                      Colors.pink,
+                    ]
+                    .map(
+                      (c) => GestureDetector(
+                        onTap: () => s.updateAccent(c),
+                        child: CircleAvatar(
+                          backgroundColor: c,
+                          radius: 18,
+                          child: s.accentColor.value == c.value
+                              ? const Icon(Icons.check, color: Colors.white)
+                              : null,
+                        ),
+                      ),
+                    )
+                    .toList(),
+          ),
+        ],
       ),
     );
   }
