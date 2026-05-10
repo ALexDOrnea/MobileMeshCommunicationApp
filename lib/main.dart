@@ -5,11 +5,13 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:nearby_connections/nearby_connections.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
+import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
@@ -18,6 +20,7 @@ const String kEndpointSeparator = "::";
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AppNotifications.init();
   final prefs = await SharedPreferences.getInstance();
 
   runApp(
@@ -29,6 +32,63 @@ void main() async {
       child: const MeshChatApp(),
     ),
   );
+}
+
+// --- NOTIFICĂRI LOCALE ---
+class AppNotifications {
+  static final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+
+  static const AndroidNotificationChannel _androidChannel =
+      AndroidNotificationChannel(
+        'meshchat_messages',
+        'MeshChat Messages',
+        description: 'Notificări pentru mesaje primite prin Nearby',
+        importance: Importance.high,
+      );
+
+  static Future<void> init() async {
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const initSettings = InitializationSettings(android: androidInit);
+
+    await _plugin.initialize(initSettings);
+
+    final androidPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    await androidPlugin?.createNotificationChannel(_androidChannel);
+  }
+
+  static Future<bool> requestPermission() async {
+    if (!Platform.isAndroid) return true;
+
+    final status = await Permission.notification.request();
+    return status.isGranted;
+  }
+
+  static Future<void> showMessage({
+    required String title,
+    required String body,
+  }) async {
+    const androidDetails = AndroidNotificationDetails(
+      'meshchat_messages',
+      'MeshChat Messages',
+      channelDescription: 'Notificări pentru mesaje primite prin Nearby',
+      importance: Importance.high,
+      priority: Priority.high,
+      icon: '@mipmap/ic_launcher',
+    );
+
+    const details = NotificationDetails(android: androidDetails);
+
+    await _plugin.show(
+      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      title,
+      body,
+      details,
+    );
+  }
 }
 
 // --- PERMISIUNI NEARBY ---
@@ -61,6 +121,13 @@ Future<bool> requestNearbyPermissions() async {
   return locationOk && scanOk && advertiseOk && connectOk && nearbyWifiOk;
 }
 
+Future<bool> requestMicrophonePermission() async {
+  if (!Platform.isAndroid && !Platform.isIOS) return true;
+
+  final status = await Permission.microphone.request();
+  return status.isGranted;
+}
+
 // --- MODELE DE DATE ---
 class ChatMessage {
   final String id;
@@ -82,6 +149,7 @@ class ChatMessage {
   });
 
   bool get isFile => type == "file";
+  bool get isVoice => type == "voice";
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -160,7 +228,7 @@ class NearbyConnectionRequest {
   });
 }
 
-enum NearbyIncomingType { text, file }
+enum NearbyIncomingType { text, file, voice }
 
 class NearbyIncomingMessage {
   final String endpointId;
@@ -210,6 +278,7 @@ class SettingsProvider extends ChangeNotifier {
 
   bool _isDarkMode = true;
   bool _saveHistory = true;
+  bool _notificationsEnabled = true;
   Color _accentColor = const Color(0xFF0052D4);
   String _alias = "MeshChat";
   List<ChatThread> _threads = [];
@@ -217,6 +286,7 @@ class SettingsProvider extends ChangeNotifier {
   SettingsProvider(this._prefs) {
     _isDarkMode = _prefs.getBool('dark_mode') ?? true;
     _saveHistory = _prefs.getBool('save_history') ?? true;
+    _notificationsEnabled = _prefs.getBool('notifications_enabled') ?? true;
     _accentColor = Color(_prefs.getInt('accent_color') ?? 0xFF0052D4);
     _alias = _prefs.getString('alias') ?? "MeshChat";
     _loadThreads();
@@ -224,6 +294,7 @@ class SettingsProvider extends ChangeNotifier {
 
   bool get isDarkMode => _isDarkMode;
   bool get saveHistory => _saveHistory;
+  bool get notificationsEnabled => _notificationsEnabled;
   Color get accentColor => _accentColor;
   String get alias => _alias;
   List<ChatThread> get threads => _threads;
@@ -246,6 +317,17 @@ class SettingsProvider extends ChangeNotifier {
   void toggleSaveHistory(bool val) {
     _saveHistory = val;
     _prefs.setBool('save_history', val);
+    notifyListeners();
+  }
+
+  Future<void> toggleNotifications(bool val) async {
+    if (val) {
+      final ok = await AppNotifications.requestPermission();
+      if (!ok) return;
+    }
+
+    _notificationsEnabled = val;
+    _prefs.setBool('notifications_enabled', val);
     notifyListeners();
   }
 
@@ -366,6 +448,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
   final Map<String, String> _connectedEndpointByNodeId = {};
   final Map<int, String> _pendingFileNames = {};
   final Map<int, String> _pendingFileUris = {};
+  final Map<int, String> _pendingFileKinds = {};
 
   final StreamController<NearbyIncomingMessage> _incomingController =
       StreamController<NearbyIncomingMessage>.broadcast();
@@ -671,7 +754,8 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       return;
     }
 
-    final safeName = fileName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final kind = _pendingFileKinds[payloadId] ?? "file";
+    final safeName = fileName.replaceAll(RegExp(r'[\/:*?"<>|]'), '_');
     final destinationPath = "${dir.path}/$safeName";
 
     final copied = await Nearby().copyFileAndDeleteOriginal(
@@ -689,8 +773,12 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
           endpointId: endpointId,
           nodeId: nodeId,
           displayName: displayName,
-          text: "📎 Fișier primit: $safeName",
-          type: NearbyIncomingType.file,
+          text: kind == "voice"
+              ? "🎤 Mesaj vocal"
+              : "📎 Fișier primit: $safeName",
+          type: kind == "voice"
+              ? NearbyIncomingType.voice
+              : NearbyIncomingType.file,
           filePath: destinationPath,
           fileName: safeName,
         ),
@@ -701,6 +789,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     _pendingFileNames.remove(payloadId);
     _pendingFileUris.remove(payloadId);
+    _pendingFileKinds.remove(payloadId);
   }
 
   void _onPayloadReceived(String endpointId, Payload payload) {
@@ -721,8 +810,10 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
           final data = jsonDecode(raw) as Map<String, dynamic>;
           final payloadId = data["payloadId"] as int;
           final fileName = data["fileName"] as String;
+          final kind = (data["kind"] as String?) ?? "file";
 
           _pendingFileNames[payloadId] = fileName;
+          _pendingFileKinds[payloadId] = kind;
           _saveReceivedFileIfReady(
             payloadId: payloadId,
             endpointId: endpointId,
@@ -805,14 +896,44 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       return null;
     }
 
+    return sendPathPayloadToDevice(
+      nodeId: nodeId,
+      path: path,
+      fileName: picked.name,
+      size: picked.size,
+      kind: "file",
+    );
+  }
+
+  Future<String?> sendPathPayloadToDevice({
+    required String nodeId,
+    required String path,
+    required String fileName,
+    required int size,
+    String kind = "file",
+  }) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) {
+      _status = "Device-ul nu este conectat.";
+      notifyListeners();
+      return null;
+    }
+
+    final sourceFile = File(path);
+    if (!await sourceFile.exists()) {
+      _status = "Fișierul nu există local.";
+      notifyListeners();
+      return null;
+    }
+
     try {
       final payloadId = await Nearby().sendFilePayload(endpointId, path);
-      final fileName = picked.name;
 
       final metadata = {
         "payloadId": payloadId,
         "fileName": fileName,
-        "size": picked.size,
+        "size": size,
+        "kind": kind,
       };
 
       await Nearby().sendBytesPayload(
@@ -822,7 +943,9 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
       return path;
     } catch (e) {
-      _status = "Eroare trimitere fișier: $e";
+      _status = kind == "voice"
+          ? "Eroare trimitere mesaj vocal: $e"
+          : "Eroare trimitere fișier: $e";
       notifyListeners();
       return null;
     }
@@ -885,16 +1008,18 @@ class MainShell extends StatefulWidget {
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
+class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _idx = 1;
   final PageController _pageController = PageController(initialPage: 1);
 
   StreamSubscription<NearbyIncomingMessage>? _incomingSub;
   StreamSubscription<NearbyConnectionRequest>? _connectionRequestSub;
+  bool _isAppInForeground = true;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final nearby = Provider.of<NearbyProvider>(context, listen: false);
@@ -911,10 +1036,16 @@ class _MainShellState extends State<MainShell> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _incomingSub?.cancel();
     _connectionRequestSub?.cancel();
     _pageController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _isAppInForeground = state == AppLifecycleState.resumed;
   }
 
   void _goToPage(int i) {
@@ -971,7 +1102,9 @@ class _MainShellState extends State<MainShell> {
   void _saveIncomingMessageDirectly(NearbyIncomingMessage incoming) {
     if (!mounted) return;
 
-    Provider.of<SettingsProvider>(context, listen: false).addIncomingMessage(
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+
+    settings.addIncomingMessage(
       deviceId: incoming.nodeId,
       title: incoming.displayName,
       message: ChatMessage(
@@ -979,16 +1112,36 @@ class _MainShellState extends State<MainShell> {
         text: incoming.text,
         isMine: false,
         timestamp: DateTime.now(),
-        type: incoming.type == NearbyIncomingType.file ? "file" : "text",
+        type: incoming.type == NearbyIncomingType.voice
+            ? "voice"
+            : incoming.type == NearbyIncomingType.file
+            ? "file"
+            : "text",
         fileName: incoming.fileName,
         filePath: incoming.filePath,
       ),
     );
 
+    final notificationBody = incoming.type == NearbyIncomingType.voice
+        ? "Mesaj vocal nou"
+        : incoming.type == NearbyIncomingType.file
+        ? "Fișier primit: ${incoming.fileName ?? "fișier"}"
+        : incoming.text;
+
+    if (!_isAppInForeground && settings.notificationsEnabled) {
+      AppNotifications.showMessage(
+        title: incoming.displayName,
+        body: notificationBody,
+      );
+      return;
+    }
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          incoming.type == NearbyIncomingType.file
+          incoming.type == NearbyIncomingType.voice
+              ? "Mesaj vocal nou de la ${incoming.displayName}"
+              : incoming.type == NearbyIncomingType.file
               ? "Fișier primit de la ${incoming.displayName}: ${incoming.fileName ?? "fișier"}"
               : "Mesaj nou de la ${incoming.displayName}",
         ),
@@ -1337,6 +1490,10 @@ class ModernChatRoom extends StatefulWidget {
 class _ModernChatRoomState extends State<ModernChatRoom> {
   final TextEditingController _msgController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final AudioRecorder _audioRecorder = AudioRecorder();
+
+  bool _isRecordingVoice = false;
+  String? _recordingPath;
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1371,6 +1528,18 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
         lower.endsWith(".mkv") ||
         lower.endsWith(".webm") ||
         lower.endsWith(".avi");
+  }
+
+  bool _isAudioFile(String? fileName) {
+    if (fileName == null) return false;
+    final lower = fileName.toLowerCase();
+
+    return lower.endsWith(".m4a") ||
+        lower.endsWith(".aac") ||
+        lower.endsWith(".mp3") ||
+        lower.endsWith(".wav") ||
+        lower.endsWith(".ogg") ||
+        lower.endsWith(".opus");
   }
 
   Future<void> _openFile(ChatMessage message) async {
@@ -1443,6 +1612,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
     final imagePreview = fileExists && _isImageFile(fileName);
     final videoPreview = _isVideoFile(fileName);
+    final audioPreview = message.isVoice || _isAudioFile(fileName);
 
     return Container(
       constraints: const BoxConstraints(maxWidth: 280),
@@ -1476,14 +1646,18 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                 borderRadius: BorderRadius.circular(10),
               ),
               child: Icon(
-                videoPreview ? Icons.videocam : Icons.insert_drive_file,
+                audioPreview
+                    ? Icons.mic
+                    : videoPreview
+                    ? Icons.videocam
+                    : Icons.insert_drive_file,
                 size: 46,
                 color: message.isMine ? Colors.white : null,
               ),
             ),
           const SizedBox(height: 8),
           Text(
-            fileName,
+            message.isVoice ? "Mesaj vocal" : fileName,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
@@ -1493,18 +1667,23 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
           ),
           const SizedBox(height: 8),
           Row(
-            mainAxisSize: MainAxisSize.min,
             children: [
-              OutlinedButton.icon(
-                onPressed: fileExists ? () => _openFile(message) : null,
-                icon: const Icon(Icons.open_in_new, size: 16),
-                label: const Text("Open"),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: fileExists ? () => _openFile(message) : null,
+                  icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                  label: Text(
+                    message.isVoice || audioPreview ? "Play" : "Open",
+                  ),
+                ),
               ),
               const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: fileExists ? () => _downloadFile(message) : null,
-                icon: const Icon(Icons.download, size: 16),
-                label: const Text("Save"),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: fileExists ? () => _downloadFile(message) : null,
+                  icon: const Icon(Icons.file_download_outlined, size: 18),
+                  label: const Text("Save"),
+                ),
               ),
             ],
           ),
@@ -1568,6 +1747,136 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     _scrollToBottom();
   }
 
+  Future<void> _toggleVoiceRecording(ChatThread thread) async {
+    if (_isRecordingVoice) {
+      await _stopAndSendVoice(thread);
+    } else {
+      await _startVoiceRecording(thread);
+    }
+  }
+
+  Future<void> _startVoiceRecording(ChatThread thread) async {
+    final nodeId = thread.deviceId;
+    if (nodeId == null) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+    if (!nearby.isDeviceConnected(nodeId)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Conectează-te la device înainte să trimiți mesaje vocale.",
+          ),
+        ),
+      );
+      return;
+    }
+
+    final micOk = await requestMicrophonePermission();
+    if (!micOk) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Permisiunea pentru microfon este necesară pentru mesaje vocale.",
+          ),
+        ),
+      );
+      return;
+    }
+
+    final hasRecorderPermission = await _audioRecorder.hasPermission();
+    if (!hasRecorderPermission) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Aplicația nu are acces la microfon.")),
+      );
+      return;
+    }
+
+    final dir = await getTemporaryDirectory();
+    final fileName = "voice_${DateTime.now().millisecondsSinceEpoch}.m4a";
+    final path = "${dir.path}/$fileName";
+
+    await _audioRecorder.start(
+      const RecordConfig(encoder: AudioEncoder.aacLc),
+      path: path,
+    );
+
+    setState(() {
+      _isRecordingVoice = true;
+      _recordingPath = path;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Înregistrare pornită. Apasă din nou pe microfon ca să trimiți.",
+        ),
+      ),
+    );
+  }
+
+  Future<void> _stopAndSendVoice(ChatThread thread) async {
+    final nodeId = thread.deviceId;
+    if (nodeId == null) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+
+    final stoppedPath = await _audioRecorder.stop();
+
+    setState(() {
+      _isRecordingVoice = false;
+      _recordingPath = null;
+    });
+
+    final path = stoppedPath;
+    if (path == null || path.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Înregistrarea nu a fost salvată.")),
+      );
+      return;
+    }
+
+    final file = File(path);
+    if (!await file.exists()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Fișierul audio nu există local.")),
+      );
+      return;
+    }
+
+    final fileName = path.split(Platform.pathSeparator).last;
+    final sentPath = await nearby.sendPathPayloadToDevice(
+      nodeId: nodeId,
+      path: path,
+      fileName: fileName,
+      size: await file.length(),
+      kind: "voice",
+    );
+
+    if (sentPath == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(nearby.status)));
+      return;
+    }
+
+    settings.addMessageToThreadId(
+      thread.id,
+      ChatMessage(
+        id: const Uuid().v4(),
+        text: "🎤 Mesaj vocal",
+        isMine: true,
+        timestamp: DateTime.now(),
+        type: "voice",
+        fileName: fileName,
+        filePath: sentPath,
+      ),
+    );
+
+    _scrollToBottom();
+  }
+
   Future<void> _send(ChatThread thread) async {
     if (_msgController.text.trim().isEmpty) return;
 
@@ -1609,6 +1918,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
   @override
   void dispose() {
+    _audioRecorder.dispose();
     _msgController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -1700,7 +2010,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                         alignment: message.isMine
                             ? Alignment.centerRight
                             : Alignment.centerLeft,
-                        child: message.isFile
+                        child: (message.isFile || message.isVoice)
                             ? _buildFileBubble(message)
                             : Container(
                                 padding: const EdgeInsets.all(12),
@@ -1741,6 +2051,12 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                   IconButton(
                     onPressed: connected ? () => _sendFile(thread) : null,
                     icon: const Icon(Icons.attach_file),
+                  ),
+                  IconButton.filledTonal(
+                    onPressed: connected
+                        ? () => _toggleVoiceRecording(thread)
+                        : null,
+                    icon: Icon(_isRecordingVoice ? Icons.stop : Icons.mic),
                   ),
                   IconButton.filled(
                     onPressed: () => _send(thread),
@@ -1862,6 +2178,14 @@ class _SettingsPageState extends State<SettingsPage> {
             title: const Text("Save History"),
             value: settings.saveHistory,
             onChanged: (v) => settings.toggleSaveHistory(v),
+          ),
+          SwitchListTile(
+            title: const Text("Notifications"),
+            subtitle: const Text(
+              "Primești notificări doar când aplicația nu este deschisă.",
+            ),
+            value: settings.notificationsEnabled,
+            onChanged: (v) => settings.toggleNotifications(v),
           ),
           ListTile(
             leading: const Icon(Icons.delete, color: Colors.red),
