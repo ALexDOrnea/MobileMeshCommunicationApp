@@ -14,69 +14,21 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 const String kNearbyServiceId = "com.meshup.chat";
+const String kEndpointSeparator = "::";
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final prefs = await SharedPreferences.getInstance();
 
   runApp(
-    ChangeNotifierProvider(
-      create: (_) => SettingsProvider(prefs),
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => SettingsProvider(prefs)),
+        ChangeNotifierProvider(create: (_) => NearbyProvider(prefs)..start()),
+      ],
       child: const MeshChatApp(),
     ),
   );
-}
-
-// --- NEARBY MESSAGE BUS ---
-enum NearbyIncomingType { text, file }
-
-class NearbyIncomingMessage {
-  final String endpointId;
-  final String text;
-  final NearbyIncomingType type;
-  final String? filePath;
-  final String? fileName;
-
-  NearbyIncomingMessage({
-    required this.endpointId,
-    required this.text,
-    required this.type,
-    this.filePath,
-    this.fileName,
-  });
-}
-
-class NearbyMessageBus {
-  static final StreamController<NearbyIncomingMessage> _controller =
-      StreamController<NearbyIncomingMessage>.broadcast();
-
-  static Stream<NearbyIncomingMessage> get stream => _controller.stream;
-
-  static void emitText(String endpointId, String text) {
-    _controller.add(
-      NearbyIncomingMessage(
-        endpointId: endpointId,
-        text: text,
-        type: NearbyIncomingType.text,
-      ),
-    );
-  }
-
-  static void emitFile({
-    required String endpointId,
-    required String filePath,
-    required String fileName,
-  }) {
-    _controller.add(
-      NearbyIncomingMessage(
-        endpointId: endpointId,
-        text: "📎 Fișier primit: $fileName",
-        type: NearbyIncomingType.file,
-        filePath: filePath,
-        fileName: fileName,
-      ),
-    );
-  }
 }
 
 // --- PERMISIUNI NEARBY ---
@@ -115,10 +67,7 @@ class ChatMessage {
   final String text;
   final bool isMine;
   final DateTime timestamp;
-
-  // "text" sau "file"
   final String type;
-
   final String? fileName;
   final String? filePath;
 
@@ -157,7 +106,9 @@ class ChatMessage {
 
 class ChatThread {
   final String id;
-  final String title;
+  String title;
+
+  /// Acesta este ID-ul permanent al celuilalt telefon, nu endpointId-ul Nearby.
   final String? deviceId;
   List<ChatMessage> messages;
 
@@ -185,7 +136,75 @@ class ChatThread {
   );
 }
 
-// --- PROVIDER SETĂRI ---
+class NearbyDevice {
+  final String endpointId;
+  final String nodeId;
+  final String displayName;
+
+  NearbyDevice({
+    required this.endpointId,
+    required this.nodeId,
+    required this.displayName,
+  });
+}
+
+class NearbyConnectionRequest {
+  final String endpointId;
+  final String nodeId;
+  final String displayName;
+
+  NearbyConnectionRequest({
+    required this.endpointId,
+    required this.nodeId,
+    required this.displayName,
+  });
+}
+
+enum NearbyIncomingType { text, file }
+
+class NearbyIncomingMessage {
+  final String endpointId;
+  final String nodeId;
+  final String displayName;
+  final String text;
+  final NearbyIncomingType type;
+  final String? filePath;
+  final String? fileName;
+
+  NearbyIncomingMessage({
+    required this.endpointId,
+    required this.nodeId,
+    required this.displayName,
+    required this.text,
+    required this.type,
+    this.filePath,
+    this.fileName,
+  });
+}
+
+class ParsedEndpointName {
+  final String displayName;
+  final String nodeId;
+
+  ParsedEndpointName({required this.displayName, required this.nodeId});
+}
+
+ParsedEndpointName parseEndpointName(String raw) {
+  if (!raw.contains(kEndpointSeparator)) {
+    return ParsedEndpointName(displayName: raw, nodeId: raw);
+  }
+
+  final parts = raw.split(kEndpointSeparator);
+  final nodeId = parts.removeLast();
+  final displayName = parts.join(kEndpointSeparator).trim();
+
+  return ParsedEndpointName(
+    displayName: displayName.isEmpty ? "MeshChat" : displayName,
+    nodeId: nodeId,
+  );
+}
+
+// --- PROVIDER SETĂRI / ISTORIC ---
 class SettingsProvider extends ChangeNotifier {
   final SharedPreferences _prefs;
 
@@ -211,7 +230,6 @@ class SettingsProvider extends ChangeNotifier {
 
   void updateAlias(String value) {
     final clean = value.trim();
-
     if (clean.isEmpty) return;
 
     _alias = clean;
@@ -251,24 +269,584 @@ class SettingsProvider extends ChangeNotifier {
     }
   }
 
-  void saveThread(ChatThread thread) {
+  void _persistThreads() {
     if (!_saveHistory) return;
-
-    _threads.removeWhere((t) => t.id == thread.id);
-    _threads.insert(0, thread);
 
     _prefs.setString(
       'chat_threads',
       jsonEncode(_threads.map((e) => e.toJson()).toList()),
     );
+  }
 
+  ChatThread? threadById(String id) {
+    try {
+      return _threads.firstWhere((t) => t.id == id);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  ChatThread? threadByDeviceId(String deviceId) {
+    try {
+      return _threads.firstWhere((t) => t.deviceId == deviceId);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  ChatThread getOrCreateThreadForDevice({
+    required String deviceId,
+    required String title,
+  }) {
+    final existing = threadByDeviceId(deviceId);
+
+    if (existing != null) {
+      if (existing.title != title && title.trim().isNotEmpty) {
+        existing.title = title;
+        _persistThreads();
+        notifyListeners();
+      }
+      return existing;
+    }
+
+    final thread = ChatThread(
+      id: const Uuid().v4(),
+      title: title,
+      deviceId: deviceId,
+      messages: [],
+    );
+
+    _threads.insert(0, thread);
+    _persistThreads();
     notifyListeners();
+    return thread;
+  }
+
+  void saveThread(ChatThread thread) {
+    if (!_saveHistory) return;
+
+    _threads.removeWhere((t) => t.id == thread.id);
+    _threads.insert(0, thread);
+    _persistThreads();
+    notifyListeners();
+  }
+
+  void addMessageToThreadId(String threadId, ChatMessage message) {
+    final thread = threadById(threadId);
+    if (thread == null) return;
+
+    thread.messages.add(message);
+    saveThread(thread);
+  }
+
+  ChatThread addIncomingMessage({
+    required String deviceId,
+    required String title,
+    required ChatMessage message,
+  }) {
+    final thread = getOrCreateThreadForDevice(deviceId: deviceId, title: title);
+    thread.messages.add(message);
+    saveThread(thread);
+    return thread;
   }
 
   void clearChats() {
     _threads.clear();
     _prefs.remove('chat_threads');
     notifyListeners();
+  }
+}
+
+// --- NEARBY GLOBAL PROVIDER ---
+class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
+  final SharedPreferences _prefs;
+  final Strategy _strategy = Strategy.P2P_CLUSTER;
+
+  final Map<String, NearbyDevice> _devicesByEndpoint = {};
+  final Map<String, String> _connectedEndpointByNodeId = {};
+  final Map<int, String> _pendingFileNames = {};
+  final Map<int, String> _pendingFileUris = {};
+
+  final StreamController<NearbyIncomingMessage> _incomingController =
+      StreamController<NearbyIncomingMessage>.broadcast();
+  final StreamController<NearbyConnectionRequest> _connectionRequestController =
+      StreamController<NearbyConnectionRequest>.broadcast();
+
+  bool _isAdvertising = false;
+  bool _isDiscovering = false;
+  bool _isStarting = false;
+  String _status = "Nearby nu a pornit încă.";
+
+  late final String _localNodeId;
+
+  NearbyProvider(this._prefs) {
+    WidgetsBinding.instance.addObserver(this);
+    _localNodeId = _prefs.getString('local_node_id') ?? const Uuid().v4();
+    _prefs.setString('local_node_id', _localNodeId);
+  }
+
+  String get localNodeId => _localNodeId;
+  bool get isAdvertising => _isAdvertising;
+  bool get isDiscovering => _isDiscovering;
+  String get status => _status;
+
+  List<NearbyDevice> get discoveredDevices =>
+      _devicesByEndpoint.values.toList();
+  Stream<NearbyIncomingMessage> get incomingMessages =>
+      _incomingController.stream;
+  Stream<NearbyConnectionRequest> get connectionRequests =>
+      _connectionRequestController.stream;
+
+  String advertisingName(String alias) =>
+      "$alias$kEndpointSeparator$_localNodeId";
+
+  bool isDeviceOnline(String? nodeId) {
+    if (nodeId == null) return false;
+    return _devicesByEndpoint.values.any((d) => d.nodeId == nodeId) ||
+        _connectedEndpointByNodeId.containsKey(nodeId);
+  }
+
+  bool isDeviceConnected(String? nodeId) {
+    if (nodeId == null) return false;
+    return _connectedEndpointByNodeId.containsKey(nodeId);
+  }
+
+  NearbyDevice? deviceByNodeId(String? nodeId) {
+    if (nodeId == null) return null;
+    for (final device in _devicesByEndpoint.values) {
+      if (device.nodeId == nodeId) return device;
+    }
+    return null;
+  }
+
+  NearbyDevice? deviceByEndpointId(String endpointId) {
+    return _devicesByEndpoint[endpointId];
+  }
+
+  Future<void> start() async {
+    if (_isStarting) return;
+    _isStarting = true;
+
+    final ok = await requestNearbyPermissions();
+
+    if (!ok) {
+      _status =
+          "Permisiuni refuzate. Activează Location / Nearby devices / Wi-Fi.";
+      _isStarting = false;
+      notifyListeners();
+      return;
+    }
+
+    await startAdvertising();
+    await startDiscovery();
+
+    _isStarting = false;
+  }
+
+  Future<void> startAdvertising() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final alias = prefs.getString('alias') ?? "MeshChat";
+
+      final result = await Nearby().startAdvertising(
+        advertisingName(alias),
+        _strategy,
+        serviceId: kNearbyServiceId,
+        onConnectionInitiated: _onConnectionInitiated,
+        onConnectionResult: _onConnectionResult,
+        onDisconnected: _onDisconnected,
+      );
+
+      _isAdvertising = result;
+      _status = result
+          ? "Advertising pornit ca $alias."
+          : "Advertising Nearby eșuat.";
+      notifyListeners();
+    } catch (e) {
+      _isAdvertising = false;
+      _status = "Eroare advertising: $e";
+      notifyListeners();
+    }
+  }
+
+  Future<void> startDiscovery() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final alias = prefs.getString('alias') ?? "MeshChat";
+
+      final result = await Nearby().startDiscovery(
+        advertisingName(alias),
+        _strategy,
+        serviceId: kNearbyServiceId,
+        onEndpointFound: (endpointId, endpointName, serviceId) {
+          final parsed = parseEndpointName(endpointName);
+
+          if (parsed.nodeId == _localNodeId) return;
+
+          _devicesByEndpoint[endpointId] = NearbyDevice(
+            endpointId: endpointId,
+            nodeId: parsed.nodeId,
+            displayName: parsed.displayName,
+          );
+
+          _status = "Găsit: ${parsed.displayName}";
+          notifyListeners();
+        },
+        onEndpointLost: (endpointId) {
+          final device = _devicesByEndpoint.remove(endpointId);
+          if (device != null) {
+            _connectedEndpointByNodeId.remove(device.nodeId);
+          }
+          notifyListeners();
+        },
+      );
+
+      _isDiscovering = result;
+      if (result) _status = "Discovery pornit. Caut alte telefoane...";
+      notifyListeners();
+    } catch (e) {
+      _isDiscovering = false;
+      _status = "Eroare discovery: $e";
+      notifyListeners();
+    }
+  }
+
+  void _onConnectionInitiated(
+    String endpointId,
+    ConnectionInfo connectionInfo,
+  ) {
+    final parsed = parseEndpointName(connectionInfo.endpointName);
+
+    _devicesByEndpoint[endpointId] = NearbyDevice(
+      endpointId: endpointId,
+      nodeId: parsed.nodeId,
+      displayName: parsed.displayName,
+    );
+
+    _status = "Cerere conexiune de la ${parsed.displayName}.";
+    notifyListeners();
+
+    _connectionRequestController.add(
+      NearbyConnectionRequest(
+        endpointId: endpointId,
+        nodeId: parsed.nodeId,
+        displayName: parsed.displayName,
+      ),
+    );
+  }
+
+  Future<void> acceptConnection(String endpointId) async {
+    try {
+      await Nearby().acceptConnection(
+        endpointId,
+        onPayLoadRecieved: _onPayloadReceived,
+        onPayloadTransferUpdate: (endpointId, update) {
+          debugPrint("Payload update from $endpointId: ${update.status}");
+        },
+      );
+
+      final device = _devicesByEndpoint[endpointId];
+      if (device != null) {
+        _status = "Conexiune acceptată cu ${device.displayName}.";
+      }
+      notifyListeners();
+    } catch (e) {
+      _status = "Eroare acceptare conexiune: $e";
+      notifyListeners();
+    }
+  }
+
+  Future<void> rejectConnection(String endpointId) async {
+    try {
+      await Nearby().rejectConnection(endpointId);
+      _status = "Conexiune respinsă.";
+      notifyListeners();
+    } catch (e) {
+      _status = "Eroare respingere conexiune: $e";
+      notifyListeners();
+    }
+  }
+
+  void _onConnectionResult(String endpointId, Status status) {
+    final device = _devicesByEndpoint[endpointId];
+    final name = device?.displayName ?? endpointId;
+
+    if (status == Status.CONNECTED) {
+      if (device != null) {
+        _connectedEndpointByNodeId[device.nodeId] = endpointId;
+      }
+      _status = "Conectat cu $name.";
+    } else {
+      if (device != null) {
+        _connectedEndpointByNodeId.remove(device.nodeId);
+      }
+      _status = "Conexiune eșuată cu $name: $status";
+    }
+
+    notifyListeners();
+  }
+
+  void _onDisconnected(String endpointId) {
+    final device = _devicesByEndpoint[endpointId];
+    if (device != null) {
+      _connectedEndpointByNodeId.remove(device.nodeId);
+      _status = "Deconectat: ${device.displayName}";
+    } else {
+      _status = "Deconectat: $endpointId";
+    }
+    notifyListeners();
+  }
+
+  Future<void> connectToDevice(String nodeId) async {
+    final device = deviceByNodeId(nodeId);
+
+    if (device == null) {
+      _status = "Device-ul nu este online sau nu a fost descoperit încă.";
+      notifyListeners();
+      return;
+    }
+
+    try {
+      _status = "Cer conexiune cu ${device.displayName}...";
+      notifyListeners();
+
+      await Nearby().requestConnection(
+        advertisingName(_prefs.getString('alias') ?? "MeshChat"),
+        device.endpointId,
+        onConnectionInitiated: _onConnectionInitiated,
+        onConnectionResult: _onConnectionResult,
+        onDisconnected: _onDisconnected,
+      );
+    } catch (e) {
+      _status = "Eroare conectare: $e";
+      notifyListeners();
+    }
+  }
+
+  Future<void> disconnectDevice(String nodeId) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) return;
+
+    try {
+      await Nearby().disconnectFromEndpoint(endpointId);
+    } catch (_) {
+      // Unele versiuni ale pluginului pot arunca eroare dacă endpointul este deja închis.
+    }
+
+    _connectedEndpointByNodeId.remove(nodeId);
+    _status = "Deconectat.";
+    notifyListeners();
+  }
+
+  Future<void> restartNearby() async {
+    try {
+      await Nearby().stopAdvertising();
+      await Nearby().stopDiscovery();
+    } catch (_) {}
+
+    _devicesByEndpoint.clear();
+    _connectedEndpointByNodeId.clear();
+    _isAdvertising = false;
+    _isDiscovering = false;
+    _status = "Restart Nearby...";
+    notifyListeners();
+
+    await Future.delayed(const Duration(milliseconds: 500));
+    await start();
+  }
+
+  Future<void> _saveReceivedFileIfReady({
+    required int payloadId,
+    required String endpointId,
+  }) async {
+    final fileName = _pendingFileNames[payloadId];
+    final fileUri = _pendingFileUris[payloadId];
+
+    if (fileName == null || fileUri == null) return;
+
+    final dir = await getExternalStorageDirectory();
+
+    if (dir == null) {
+      debugPrint("Nu am putut găsi directorul de salvare.");
+      return;
+    }
+
+    final safeName = fileName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final destinationPath = "${dir.path}/$safeName";
+
+    final copied = await Nearby().copyFileAndDeleteOriginal(
+      fileUri,
+      destinationPath,
+    );
+
+    final device = _devicesByEndpoint[endpointId];
+    final nodeId = device?.nodeId ?? endpointId;
+    final displayName = device?.displayName ?? endpointId;
+
+    if (copied) {
+      _incomingController.add(
+        NearbyIncomingMessage(
+          endpointId: endpointId,
+          nodeId: nodeId,
+          displayName: displayName,
+          text: "📎 Fișier primit: $safeName",
+          type: NearbyIncomingType.file,
+          filePath: destinationPath,
+          fileName: safeName,
+        ),
+      );
+    } else {
+      debugPrint("Copierea fișierului primit a eșuat.");
+    }
+
+    _pendingFileNames.remove(payloadId);
+    _pendingFileUris.remove(payloadId);
+  }
+
+  void _onPayloadReceived(String endpointId, Payload payload) {
+    final device = _devicesByEndpoint[endpointId];
+    final nodeId = device?.nodeId ?? endpointId;
+    final displayName = device?.displayName ?? endpointId;
+
+    if (payload.type == PayloadType.BYTES) {
+      final bytes = payload.bytes;
+      if (bytes == null) return;
+
+      final text = utf8.decode(bytes, allowMalformed: true);
+
+      if (text.startsWith("__FILE__:")) {
+        final raw = text.replaceFirst("__FILE__:", "");
+
+        try {
+          final data = jsonDecode(raw) as Map<String, dynamic>;
+          final payloadId = data["payloadId"] as int;
+          final fileName = data["fileName"] as String;
+
+          _pendingFileNames[payloadId] = fileName;
+          _saveReceivedFileIfReady(
+            payloadId: payloadId,
+            endpointId: endpointId,
+          );
+        } catch (e) {
+          debugPrint("Eroare metadata fișier: $e");
+        }
+
+        return;
+      }
+
+      _incomingController.add(
+        NearbyIncomingMessage(
+          endpointId: endpointId,
+          nodeId: nodeId,
+          displayName: displayName,
+          text: text,
+          type: NearbyIncomingType.text,
+        ),
+      );
+
+      return;
+    }
+
+    if (payload.type == PayloadType.FILE) {
+      final uri = payload.uri;
+      if (uri == null) {
+        debugPrint("Payload FILE fără uri.");
+        return;
+      }
+
+      _pendingFileUris[payload.id] = uri;
+      _saveReceivedFileIfReady(payloadId: payload.id, endpointId: endpointId);
+    }
+  }
+
+  Future<bool> sendTextToDevice(String nodeId, String text) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) {
+      _status = "Device-ul nu este conectat.";
+      notifyListeners();
+      return false;
+    }
+
+    try {
+      await Nearby().sendBytesPayload(
+        endpointId,
+        Uint8List.fromList(utf8.encode(text)),
+      );
+      return true;
+    } catch (e) {
+      _status = "Eroare trimitere Nearby: $e";
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<String?> sendFileToDevice(String nodeId) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) {
+      _status = "Device-ul nu este conectat.";
+      notifyListeners();
+      return null;
+    }
+
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      allowMultiple: false,
+      withData: false,
+    );
+
+    if (result == null || result.files.isEmpty) return null;
+
+    final picked = result.files.single;
+    final path = picked.path;
+
+    if (path == null) {
+      _status = "Nu pot accesa calea fișierului.";
+      notifyListeners();
+      return null;
+    }
+
+    try {
+      final payloadId = await Nearby().sendFilePayload(endpointId, path);
+      final fileName = picked.name;
+
+      final metadata = {
+        "payloadId": payloadId,
+        "fileName": fileName,
+        "size": picked.size,
+      };
+
+      await Nearby().sendBytesPayload(
+        endpointId,
+        Uint8List.fromList(utf8.encode("__FILE__:${jsonEncode(metadata)}")),
+      );
+
+      return path;
+    } catch (e) {
+      _status = "Eroare trimitere fișier: $e";
+      notifyListeners();
+      return null;
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      start();
+    }
+
+    // Nu oprim Nearby la paused/inactive. Astfel conexiunea are șanse să rămână vie
+    // când utilizatorul minimizează aplicația. Pentru garanție reală pe Android,
+    // ai nevoie de foreground service nativ.
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _incomingController.close();
+    _connectionRequestController.close();
+    Nearby().stopAdvertising();
+    Nearby().stopDiscovery();
+    super.dispose();
   }
 }
 
@@ -299,7 +877,7 @@ class MeshChatApp extends StatelessWidget {
   }
 }
 
-// --- NAVIGARE ---
+// --- NAVIGARE + LISTENER GLOBAL PENTRU POPUPURI ---
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
 
@@ -311,8 +889,30 @@ class _MainShellState extends State<MainShell> {
   int _idx = 1;
   final PageController _pageController = PageController(initialPage: 1);
 
+  StreamSubscription<NearbyIncomingMessage>? _incomingSub;
+  StreamSubscription<NearbyConnectionRequest>? _connectionRequestSub;
+
+  @override
+  void initState() {
+    super.initState();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+      _connectionRequestSub = nearby.connectionRequests.listen((request) {
+        _showConnectionRequestDialog(request);
+      });
+
+      _incomingSub = nearby.incomingMessages.listen((incoming) {
+        _saveIncomingMessageDirectly(incoming);
+      });
+    });
+  }
+
   @override
   void dispose() {
+    _incomingSub?.cancel();
+    _connectionRequestSub?.cancel();
     _pageController.dispose();
     super.dispose();
   }
@@ -322,6 +922,77 @@ class _MainShellState extends State<MainShell> {
       i,
       duration: const Duration(milliseconds: 300),
       curve: Curves.easeInOut,
+    );
+  }
+
+  Future<void> _showConnectionRequestDialog(
+    NearbyConnectionRequest request,
+  ) async {
+    if (!mounted) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+    final accept = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text("Cerere conexiune Nearby"),
+          content: Text("${request.displayName} vrea să se conecteze la tine."),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text("Respinge"),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text("Acceptă"),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (accept == true) {
+      await nearby.acceptConnection(request.endpointId);
+      if (!mounted) return;
+      Provider.of<SettingsProvider>(
+        context,
+        listen: false,
+      ).getOrCreateThreadForDevice(
+        deviceId: request.nodeId,
+        title: request.displayName,
+      );
+    } else {
+      await nearby.rejectConnection(request.endpointId);
+    }
+  }
+
+  void _saveIncomingMessageDirectly(NearbyIncomingMessage incoming) {
+    if (!mounted) return;
+
+    Provider.of<SettingsProvider>(context, listen: false).addIncomingMessage(
+      deviceId: incoming.nodeId,
+      title: incoming.displayName,
+      message: ChatMessage(
+        id: const Uuid().v4(),
+        text: incoming.text,
+        isMine: false,
+        timestamp: DateTime.now(),
+        type: incoming.type == NearbyIncomingType.file ? "file" : "text",
+        fileName: incoming.fileName,
+        filePath: incoming.filePath,
+      ),
+    );
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          incoming.type == NearbyIncomingType.file
+              ? "Fișier primit de la ${incoming.displayName}: ${incoming.fileName ?? "fișier"}"
+              : "Mesaj nou de la ${incoming.displayName}",
+        ),
+      ),
     );
   }
 
@@ -368,6 +1039,7 @@ class ChatListPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final settings = Provider.of<SettingsProvider>(context);
+    final nearby = Provider.of<NearbyProvider>(context);
 
     return Scaffold(
       appBar: AppBar(
@@ -377,7 +1049,7 @@ class ChatListPage extends StatelessWidget {
             child: Padding(
               padding: const EdgeInsets.only(right: 16),
               child: Text(
-                '• ${settings.threads.length} active',
+                '• ${nearby.discoveredDevices.length} online',
                 style: const TextStyle(color: Colors.green, fontSize: 12),
               ),
             ),
@@ -415,26 +1087,78 @@ class ChatListPage extends StatelessWidget {
                           itemCount: settings.threads.length,
                           itemBuilder: (context, i) {
                             final t = settings.threads[i];
+                            final online = nearby.isDeviceOnline(t.deviceId);
+                            final connected = nearby.isDeviceConnected(
+                              t.deviceId,
+                            );
 
                             return ListTile(
-                              leading: CircleAvatar(
-                                backgroundColor: settings.accentColor,
-                                child: Text(
-                                  t.title.isNotEmpty ? t.title[0] : "?",
-                                  style: const TextStyle(color: Colors.white),
-                                ),
+                              leading: Stack(
+                                children: [
+                                  CircleAvatar(
+                                    backgroundColor: settings.accentColor,
+                                    child: Text(
+                                      t.title.isNotEmpty
+                                          ? t.title[0].toUpperCase()
+                                          : "?",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                  Positioned(
+                                    right: 0,
+                                    bottom: 0,
+                                    child: Container(
+                                      width: 12,
+                                      height: 12,
+                                      decoration: BoxDecoration(
+                                        color: connected
+                                            ? Colors.green
+                                            : online
+                                            ? Colors.orange
+                                            : Colors.grey,
+                                        shape: BoxShape.circle,
+                                        border: Border.all(
+                                          color: Theme.of(
+                                            context,
+                                          ).scaffoldBackgroundColor,
+                                          width: 2,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                               title: Text(t.title),
                               subtitle: Text(
                                 t.messages.isNotEmpty
                                     ? t.messages.last.text
-                                    : "No messages",
+                                    : online
+                                    ? "Online"
+                                    : "Offline",
                                 maxLines: 1,
+                              ),
+                              trailing: Text(
+                                connected
+                                    ? "Connected"
+                                    : online
+                                    ? "Online"
+                                    : "Offline",
+                                style: TextStyle(
+                                  color: connected
+                                      ? Colors.green
+                                      : online
+                                      ? Colors.orange
+                                      : Colors.grey,
+                                  fontSize: 12,
+                                ),
                               ),
                               onTap: () => Navigator.push(
                                 context,
                                 MaterialPageRoute(
-                                  builder: (_) => ModernChatRoom(thread: t),
+                                  builder: (_) =>
+                                      ModernChatRoom(threadId: t.id),
                                 ),
                               ),
                             );
@@ -466,343 +1190,21 @@ class ChatListPage extends StatelessWidget {
 }
 
 // --- NEARBY SCAN PAGE ---
-class NearbyScannerPage extends StatefulWidget {
+class NearbyScannerPage extends StatelessWidget {
   const NearbyScannerPage({super.key});
 
   @override
-  State<NearbyScannerPage> createState() => _NearbyScannerPageState();
-}
-
-class _NearbyScannerPageState extends State<NearbyScannerPage> {
-  final Strategy _strategy = Strategy.P2P_CLUSTER;
-
-  final Map<String, String> _foundEndpoints = {};
-  final Set<String> _connectedEndpoints = {};
-
-  final Map<int, String> _pendingFileNames = {};
-  final Map<int, String> _pendingFileUris = {};
-
-  bool _isAdvertising = false;
-  bool _isDiscovering = false;
-
-  String _status = "Nearby nu a pornit încă.";
-  String _myName = "MeshChat";
-
-  @override
-  void initState() {
-    super.initState();
-
-    final alias = Provider.of<SettingsProvider>(context, listen: false).alias;
-    _myName = "$alias-${DateTime.now().millisecondsSinceEpoch % 10000}";
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _startNearby();
-    });
-  }
-
-  Future<void> _startNearby() async {
-    final ok = await requestNearbyPermissions();
-
-    if (!ok) {
-      setState(() {
-        _status =
-            "Permisiuni refuzate. Activează Location / Nearby devices / Wi-Fi.";
-      });
-      return;
-    }
-
-    await _startAdvertising();
-    await _startDiscovery();
-  }
-
-  Future<void> _startAdvertising() async {
-    try {
-      final result = await Nearby().startAdvertising(
-        _myName,
-        _strategy,
-        serviceId: kNearbyServiceId,
-        onConnectionInitiated: _onConnectionInitiated,
-        onConnectionResult: _onConnectionResult,
-        onDisconnected: _onDisconnected,
-      );
-
-      setState(() {
-        _isAdvertising = result;
-        _status = result
-            ? "Advertising pornit ca $_myName."
-            : "Advertising Nearby eșuat.";
-      });
-    } catch (e) {
-      setState(() {
-        _isAdvertising = false;
-        _status = "Eroare advertising: $e";
-      });
-    }
-  }
-
-  Future<void> _startDiscovery() async {
-    try {
-      final result = await Nearby().startDiscovery(
-        _myName,
-        _strategy,
-        serviceId: kNearbyServiceId,
-        onEndpointFound: (endpointId, endpointName, serviceId) {
-          debugPrint("Endpoint found: $endpointId $endpointName $serviceId");
-
-          setState(() {
-            _foundEndpoints[endpointId] = endpointName;
-            _status = "Găsit: $endpointName";
-          });
-        },
-        onEndpointLost: (endpointId) {
-          debugPrint("Endpoint lost: $endpointId");
-
-          setState(() {
-            _foundEndpoints.remove(endpointId);
-          });
-        },
-      );
-
-      setState(() {
-        _isDiscovering = result;
-        if (result) {
-          _status = "Discovery pornit. Caut alte telefoane...";
-        }
-      });
-    } catch (e) {
-      setState(() {
-        _isDiscovering = false;
-        _status = "Eroare discovery: $e";
-      });
-    }
-  }
-
-  void _onConnectionInitiated(
-    String endpointId,
-    ConnectionInfo connectionInfo,
-  ) {
-    debugPrint(
-      "Connection initiated: $endpointId ${connectionInfo.endpointName}",
-    );
-
-    Nearby().acceptConnection(
-      endpointId,
-      onPayLoadRecieved: _onPayloadReceived,
-      onPayloadTransferUpdate: (endpointId, update) {
-        debugPrint("Payload update from $endpointId: ${update.status}");
-      },
-    );
-
-    setState(() {
-      _foundEndpoints[endpointId] = connectionInfo.endpointName;
-      _status = "Conexiune inițiată cu ${connectionInfo.endpointName}.";
-    });
-  }
-
-  void _onConnectionResult(String endpointId, Status status) {
-    debugPrint("Connection result: $endpointId $status");
-
-    final endpointName = _foundEndpoints[endpointId] ?? endpointId;
-
-    if (status == Status.CONNECTED) {
-      setState(() {
-        _connectedEndpoints.add(endpointId);
-        _status = "Conectat cu $endpointName.";
-      });
-
-      final thread = ChatThread(
-        id: const Uuid().v4(),
-        title: endpointName,
-        deviceId: endpointId,
-        messages: [],
-      );
-
-      Provider.of<SettingsProvider>(context, listen: false).saveThread(thread);
-
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) =>
-              ModernChatRoom(thread: thread, endpointId: endpointId),
-        ),
-      );
-    } else {
-      setState(() {
-        _connectedEndpoints.remove(endpointId);
-        _status = "Conexiune eșuată cu $endpointName: $status";
-      });
-    }
-  }
-
-  void _onDisconnected(String endpointId) {
-    debugPrint("Disconnected: $endpointId");
-
-    setState(() {
-      _connectedEndpoints.remove(endpointId);
-      _status = "Deconectat: $endpointId";
-    });
-  }
-
-  Future<void> _saveReceivedFileIfReady({
-    required int payloadId,
-    required String endpointId,
-  }) async {
-    final fileName = _pendingFileNames[payloadId];
-    final fileUri = _pendingFileUris[payloadId];
-
-    if (fileName == null || fileUri == null) return;
-
-    final dir = await getExternalStorageDirectory();
-
-    if (dir == null) {
-      debugPrint("Nu am putut găsi directorul de salvare.");
-      return;
-    }
-
-    final safeName = fileName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
-    final destinationPath = "${dir.path}/$safeName";
-
-    final copied = await Nearby().copyFileAndDeleteOriginal(
-      fileUri,
-      destinationPath,
-    );
-
-    if (copied) {
-      NearbyMessageBus.emitFile(
-        endpointId: endpointId,
-        filePath: destinationPath,
-        fileName: safeName,
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Fișier primit: $safeName")));
-      }
-    } else {
-      debugPrint("Copierea fișierului primit a eșuat.");
-    }
-
-    _pendingFileNames.remove(payloadId);
-    _pendingFileUris.remove(payloadId);
-  }
-
-  void _onPayloadReceived(String endpointId, Payload payload) {
-    if (payload.type == PayloadType.BYTES) {
-      final bytes = payload.bytes;
-
-      if (bytes == null) return;
-
-      final text = utf8.decode(bytes, allowMalformed: true);
-
-      if (text.startsWith("__FILE__:")) {
-        final raw = text.replaceFirst("__FILE__:", "");
-
-        try {
-          final data = jsonDecode(raw) as Map<String, dynamic>;
-
-          final payloadId = data["payloadId"] as int;
-          final fileName = data["fileName"] as String;
-
-          _pendingFileNames[payloadId] = fileName;
-
-          _saveReceivedFileIfReady(
-            payloadId: payloadId,
-            endpointId: endpointId,
-          );
-        } catch (e) {
-          debugPrint("Eroare metadata fișier: $e");
-        }
-
-        return;
-      }
-
-      debugPrint("Message received from $endpointId: $text");
-
-      NearbyMessageBus.emitText(endpointId, text);
-
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Mesaj primit: $text")));
-      }
-
-      return;
-    }
-
-    if (payload.type == PayloadType.FILE) {
-      final uri = payload.uri;
-
-      if (uri == null) {
-        debugPrint("Payload FILE fără uri.");
-        return;
-      }
-
-      _pendingFileUris[payload.id] = uri;
-
-      _saveReceivedFileIfReady(payloadId: payload.id, endpointId: endpointId);
-    }
-  }
-
-  Future<void> _connectToEndpoint(String endpointId) async {
-    final endpointName = _foundEndpoints[endpointId] ?? endpointId;
-
-    try {
-      setState(() {
-        _status = "Cer conexiune cu $endpointName...";
-      });
-
-      await Nearby().requestConnection(
-        _myName,
-        endpointId,
-        onConnectionInitiated: _onConnectionInitiated,
-        onConnectionResult: _onConnectionResult,
-        onDisconnected: _onDisconnected,
-      );
-    } catch (e) {
-      setState(() {
-        _status = "Eroare conectare: $e";
-      });
-    }
-  }
-
-  Future<void> _restartNearby() async {
-    await Nearby().stopAdvertising();
-    await Nearby().stopDiscovery();
-
-    final alias = Provider.of<SettingsProvider>(context, listen: false).alias;
-
-    setState(() {
-      _myName = "$alias-${DateTime.now().millisecondsSinceEpoch % 10000}";
-      _foundEndpoints.clear();
-      _connectedEndpoints.clear();
-      _isAdvertising = false;
-      _isDiscovering = false;
-      _status = "Restart Nearby...";
-    });
-
-    await Future.delayed(const Duration(milliseconds: 500));
-
-    await _startNearby();
-  }
-
-  @override
-  void dispose() {
-    Nearby().stopAdvertising();
-    Nearby().stopDiscovery();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    final entries = _foundEndpoints.entries.toList();
+    final nearby = Provider.of<NearbyProvider>(context);
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+    final entries = nearby.discoveredDevices;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text("Nearby Scan"),
         actions: [
           IconButton(
-            onPressed: _restartNearby,
+            onPressed: nearby.restartNearby,
             icon: const Icon(Icons.refresh),
           ),
         ],
@@ -814,15 +1216,18 @@ class _NearbyScannerPageState extends State<NearbyScannerPage> {
             Card(
               child: ListTile(
                 leading: Icon(
-                  _isAdvertising && _isDiscovering
+                  nearby.isAdvertising && nearby.isDiscovering
                       ? Icons.wifi_tethering
                       : Icons.wifi_tethering_off,
-                  color: _isAdvertising && _isDiscovering
+                  color: nearby.isAdvertising && nearby.isDiscovering
                       ? Colors.green
                       : Colors.orange,
                 ),
-                title: Text("My name: $_myName"),
-                subtitle: Text(_status),
+                title: Text("My name: ${settings.alias}"),
+                subtitle: Text(
+                  "${nearby.status}\nID permanent: ${nearby.localNodeId}",
+                ),
+                isThreeLine: true,
               ),
             ),
             const SizedBox(height: 12),
@@ -830,18 +1235,20 @@ class _NearbyScannerPageState extends State<NearbyScannerPage> {
               children: [
                 Expanded(
                   child: ElevatedButton(
-                    onPressed: _startAdvertising,
+                    onPressed: nearby.startAdvertising,
                     child: Text(
-                      _isAdvertising ? "Advertising ON" : "Start Advertising",
+                      nearby.isAdvertising
+                          ? "Advertising ON"
+                          : "Start Advertising",
                     ),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton(
-                    onPressed: _startDiscovery,
+                    onPressed: nearby.startDiscovery,
                     child: Text(
-                      _isDiscovering ? "Discovery ON" : "Start Discovery",
+                      nearby.isDiscovering ? "Discovery ON" : "Start Discovery",
                     ),
                   ),
                 ),
@@ -859,10 +1266,9 @@ class _NearbyScannerPageState extends State<NearbyScannerPage> {
                   : ListView.builder(
                       itemCount: entries.length,
                       itemBuilder: (context, index) {
-                        final endpointId = entries[index].key;
-                        final endpointName = entries[index].value;
-                        final isConnected = _connectedEndpoints.contains(
-                          endpointId,
+                        final device = entries[index];
+                        final isConnected = nearby.isDeviceConnected(
+                          device.nodeId,
                         );
 
                         return Card(
@@ -873,16 +1279,39 @@ class _NearbyScannerPageState extends State<NearbyScannerPage> {
                                   : Icons.phone_android,
                               color: isConnected ? Colors.green : null,
                             ),
-                            title: Text(endpointName),
-                            subtitle: Text(endpointId),
+                            title: Text(device.displayName),
+                            subtitle: Text("Node ID: ${device.nodeId}"),
                             trailing: ElevatedButton(
                               onPressed: isConnected
                                   ? null
-                                  : () => _connectToEndpoint(endpointId),
+                                  : () async {
+                                      settings.getOrCreateThreadForDevice(
+                                        deviceId: device.nodeId,
+                                        title: device.displayName,
+                                      );
+                                      await nearby.connectToDevice(
+                                        device.nodeId,
+                                      );
+                                    },
                               child: Text(
                                 isConnected ? "Connected" : "Connect",
                               ),
                             ),
+                            onTap: () {
+                              final thread = settings
+                                  .getOrCreateThreadForDevice(
+                                    deviceId: device.nodeId,
+                                    title: device.displayName,
+                                  );
+
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      ModernChatRoom(threadId: thread.id),
+                                ),
+                              );
+                            },
                           ),
                         );
                       },
@@ -897,10 +1326,9 @@ class _NearbyScannerPageState extends State<NearbyScannerPage> {
 
 // --- CHAT ROOM ---
 class ModernChatRoom extends StatefulWidget {
-  final ChatThread thread;
-  final String? endpointId;
+  final String threadId;
 
-  const ModernChatRoom({super.key, required this.thread, this.endpointId});
+  const ModernChatRoom({super.key, required this.threadId});
 
   @override
   State<ModernChatRoom> createState() => _ModernChatRoomState();
@@ -909,44 +1337,6 @@ class ModernChatRoom extends StatefulWidget {
 class _ModernChatRoomState extends State<ModernChatRoom> {
   final TextEditingController _msgController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
-
-  StreamSubscription<NearbyIncomingMessage>? _nearbySub;
-
-  String _connectionStatus = "Local chat";
-
-  @override
-  void initState() {
-    super.initState();
-
-    if (widget.endpointId != null) {
-      _connectionStatus = "Connected Nearby";
-
-      _nearbySub = NearbyMessageBus.stream.listen((incoming) {
-        if (incoming.endpointId != widget.endpointId) return;
-
-        setState(() {
-          widget.thread.messages.add(
-            ChatMessage(
-              id: const Uuid().v4(),
-              text: incoming.text,
-              isMine: false,
-              timestamp: DateTime.now(),
-              type: incoming.type == NearbyIncomingType.file ? "file" : "text",
-              fileName: incoming.fileName,
-              filePath: incoming.filePath,
-            ),
-          );
-        });
-
-        _scrollToBottom();
-
-        Provider.of<SettingsProvider>(
-          context,
-          listen: false,
-        ).saveThread(widget.thread);
-      });
-    }
-  }
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -962,7 +1352,6 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
   bool _isImageFile(String? fileName) {
     if (fileName == null) return false;
-
     final lower = fileName.toLowerCase();
 
     return lower.endsWith(".jpg") ||
@@ -975,7 +1364,6 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
   bool _isVideoFile(String? fileName) {
     if (fileName == null) return false;
-
     final lower = fileName.toLowerCase();
 
     return lower.endsWith(".mp4") ||
@@ -1136,132 +1524,91 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     );
   }
 
-  Future<void> _sendFile() async {
-    if (widget.endpointId == null) {
+  Future<void> _sendFile(ChatThread thread) async {
+    final nodeId = thread.deviceId;
+    if (nodeId == null) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+
+    if (!nearby.isDeviceConnected(nodeId)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text(
-            "Conectează-te la un device înainte să trimiți fișiere.",
-          ),
+          content: Text("Conectează-te la device înainte să trimiți fișiere."),
         ),
       );
       return;
     }
 
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.any,
-      allowMultiple: false,
-      withData: false,
-    );
-
-    if (result == null || result.files.isEmpty) return;
-
-    final picked = result.files.single;
-    final path = picked.path;
-
-    if (path == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Nu pot accesa calea fișierului.")),
-      );
-      return;
-    }
-
-    try {
-      final payloadId = await Nearby().sendFilePayload(
-        widget.endpointId!,
-        path,
-      );
-
-      final fileName = picked.name;
-
-      final metadata = {
-        "payloadId": payloadId,
-        "fileName": fileName,
-        "size": picked.size,
-      };
-
-      await Nearby().sendBytesPayload(
-        widget.endpointId!,
-        Uint8List.fromList(utf8.encode("__FILE__:${jsonEncode(metadata)}")),
-      );
-
-      setState(() {
-        widget.thread.messages.add(
-          ChatMessage(
-            id: const Uuid().v4(),
-            text: "📎 Fișier trimis: $fileName",
-            isMine: true,
-            timestamp: DateTime.now(),
-            type: "file",
-            fileName: fileName,
-            filePath: path,
-          ),
-        );
-      });
-
-      _scrollToBottom();
-
-      Provider.of<SettingsProvider>(
-        context,
-        listen: false,
-      ).saveThread(widget.thread);
-    } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text("Eroare trimitere fișier: $e")));
-    }
-  }
-
-  Future<void> _send() async {
-    if (_msgController.text.trim().isEmpty) return;
-
-    final text = _msgController.text.trim();
-
-    setState(() {
-      widget.thread.messages.add(
-        ChatMessage(
-          id: const Uuid().v4(),
-          text: text,
-          isMine: true,
-          timestamp: DateTime.now(),
-        ),
-      );
-    });
-
-    _scrollToBottom();
-
-    if (widget.endpointId != null) {
-      try {
-        await Nearby().sendBytesPayload(
-          widget.endpointId!,
-          Uint8List.fromList(utf8.encode(text)),
-        );
-      } catch (e) {
+    final sentPath = await nearby.sendFileToDevice(nodeId);
+    if (sentPath == null) {
+      if (nearby.status.isNotEmpty) {
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text("Eroare trimitere Nearby: $e")));
+        ).showSnackBar(SnackBar(content: Text(nearby.status)));
+      }
+      return;
+    }
+
+    final fileName = sentPath.split(Platform.pathSeparator).last;
+
+    settings.addMessageToThreadId(
+      thread.id,
+      ChatMessage(
+        id: const Uuid().v4(),
+        text: "📎 Fișier trimis: $fileName",
+        isMine: true,
+        timestamp: DateTime.now(),
+        type: "file",
+        fileName: fileName,
+        filePath: sentPath,
+      ),
+    );
+
+    _scrollToBottom();
+  }
+
+  Future<void> _send(ChatThread thread) async {
+    if (_msgController.text.trim().isEmpty) return;
+
+    final nodeId = thread.deviceId;
+    final text = _msgController.text.trim();
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+    settings.addMessageToThreadId(
+      thread.id,
+      ChatMessage(
+        id: const Uuid().v4(),
+        text: text,
+        isMine: true,
+        timestamp: DateTime.now(),
+      ),
+    );
+
+    _msgController.clear();
+    _scrollToBottom();
+
+    if (nodeId != null) {
+      final sent = await nearby.sendTextToDevice(nodeId, text);
+      if (!sent && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(nearby.status)));
       }
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            "Chat salvat local. Pentru trimitere reală conectează-te din pagina Scan.",
+            "Chat local. Pentru trimitere reală conectează-te din Scan.",
           ),
         ),
       );
     }
-
-    _msgController.clear();
-
-    Provider.of<SettingsProvider>(
-      context,
-      listen: false,
-    ).saveThread(widget.thread);
   }
 
   @override
   void dispose() {
-    _nearbySub?.cancel();
     _msgController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -1269,42 +1616,85 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
   @override
   Widget build(BuildContext context) {
-    final canSendNearby = widget.endpointId != null;
+    final settings = Provider.of<SettingsProvider>(context);
+    final nearby = Provider.of<NearbyProvider>(context);
+    final thread = settings.threadById(widget.threadId);
+
+    if (thread == null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text("Chat")),
+        body: const Center(child: Text("Conversația nu mai există.")),
+      );
+    }
+
+    final nodeId = thread.deviceId;
+    final online = nearby.isDeviceOnline(nodeId);
+    final connected = nearby.isDeviceConnected(nodeId);
 
     return Scaffold(
       appBar: AppBar(
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(widget.thread.title),
-            Text(_connectionStatus, style: const TextStyle(fontSize: 12)),
+            Text(thread.title),
+            Text(
+              connected
+                  ? "Connected Nearby"
+                  : online
+                  ? "Online, neconectat"
+                  : "Offline",
+              style: TextStyle(
+                fontSize: 12,
+                color: connected
+                    ? Colors.green
+                    : online
+                    ? Colors.orange
+                    : null,
+              ),
+            ),
           ],
         ),
+        actions: [
+          if (nodeId != null)
+            TextButton.icon(
+              onPressed: connected
+                  ? () => nearby.disconnectDevice(nodeId)
+                  : online
+                  ? () => nearby.connectToDevice(nodeId)
+                  : null,
+              icon: Icon(connected ? Icons.link_off : Icons.link),
+              label: Text(connected ? "Disconnect" : "Connect"),
+            ),
+        ],
       ),
       body: Column(
         children: [
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(8),
-            color: canSendNearby
+            color: connected
                 ? Colors.green.withOpacity(0.15)
-                : Colors.orange.withOpacity(0.15),
+                : online
+                ? Colors.orange.withOpacity(0.15)
+                : Colors.grey.withOpacity(0.15),
             child: Text(
-              canSendNearby
+              connected
                   ? "Nearby ready: mesajele și fișierele se trimit către device-ul conectat."
-                  : "Chat local. Pentru mesaje live, conectează-te din Scan.",
+                  : online
+                  ? "Device online. Apasă Connect ca să reiei conversația."
+                  : "Device offline sau nedetectat momentan.",
               textAlign: TextAlign.center,
               style: const TextStyle(fontSize: 12),
             ),
           ),
           Expanded(
-            child: widget.thread.messages.isEmpty
+            child: thread.messages.isEmpty
                 ? const Center(child: Text("Nu există mesaje încă."))
                 : ListView.builder(
                     controller: _scrollController,
-                    itemCount: widget.thread.messages.length,
+                    itemCount: thread.messages.length,
                     itemBuilder: (context, i) {
-                      final message = widget.thread.messages[i];
+                      final message = thread.messages[i];
 
                       return Align(
                         alignment: message.isMine
@@ -1344,16 +1734,16 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                         hintText: "Mesaj...",
                         border: OutlineInputBorder(),
                       ),
-                      onSubmitted: (_) => _send(),
+                      onSubmitted: (_) => _send(thread),
                     ),
                   ),
                   const SizedBox(width: 8),
                   IconButton(
-                    onPressed: _sendFile,
+                    onPressed: connected ? () => _sendFile(thread) : null,
                     icon: const Icon(Icons.attach_file),
                   ),
                   IconButton.filled(
-                    onPressed: _send,
+                    onPressed: () => _send(thread),
                     icon: const Icon(Icons.send),
                   ),
                 ],
@@ -1394,6 +1784,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   Widget build(BuildContext context) {
     final settings = Provider.of<SettingsProvider>(context);
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
@@ -1407,7 +1798,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             title: const Text('My Device'),
             subtitle: Text(
-              "${settings.alias} • ${Platform.isAndroid ? "Android Node" : "iOS Node"}",
+              "${settings.alias} • ID permanent: ${nearby.localNodeId}",
             ),
           ),
           Card(
@@ -1428,14 +1819,14 @@ class _SettingsPageState extends State<SettingsPage> {
                       hintText: "Ex: Alex, Dva, Telefonul meu",
                       border: OutlineInputBorder(),
                     ),
-                    onSubmitted: (value) {
+                    onSubmitted: (value) async {
                       settings.updateAlias(value);
+                      await nearby.restartNearby();
 
+                      if (!context.mounted) return;
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(
-                          content: Text(
-                            "Alias salvat. Revino în Scan și apasă refresh.",
-                          ),
+                          content: Text("Alias salvat și Nearby repornit."),
                         ),
                       );
                     },
@@ -1444,14 +1835,14 @@ class _SettingsPageState extends State<SettingsPage> {
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
-                      onPressed: () {
+                      onPressed: () async {
                         settings.updateAlias(_aliasController.text);
+                        await nearby.restartNearby();
 
+                        if (!context.mounted) return;
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(
-                            content: Text(
-                              "Alias salvat. Revino în Scan și apasă refresh.",
-                            ),
+                            content: Text("Alias salvat și Nearby repornit."),
                           ),
                         );
                       },
@@ -1460,7 +1851,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                   const SizedBox(height: 4),
                   const Text(
-                    "După schimbare, revino în Scan și apasă refresh ca să repornească Nearby cu noul nume.",
+                    "Numele rămâne salvat. ID-ul permanent nu se schimbă la restart, deci conversațiile pot fi reluate când device-ul reapare online.",
                     style: TextStyle(fontSize: 12),
                   ),
                 ],
