@@ -1,86 +1,164 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:nearby_connections/nearby_connections.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
+import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
-const String kServiceUuid = "12345678-1234-1234-1234-1234567890ab";
-const String kTxCharacteristicUuid =
-    "12345678-1234-1234-1234-1234567890ac"; // write
-const String kRxCharacteristicUuid =
-    "12345678-1234-1234-1234-1234567890ad"; // notify
+const String kNearbyServiceId = "com.meshup.chat";
+const String kEndpointSeparator = "::";
 
-void main() {
-  runApp(const MeshChatApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await AppNotifications.init();
+  final prefs = await SharedPreferences.getInstance();
+
+  runApp(
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => SettingsProvider(prefs)),
+        ChangeNotifierProvider(create: (_) => NearbyProvider(prefs)..start()),
+      ],
+      child: const MeshChatApp(),
+    ),
+  );
 }
 
-class MeshChatApp extends StatelessWidget {
-  const MeshChatApp({super.key});
+// --- NOTIFICĂRI LOCALE ---
+class AppNotifications {
+  static final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'BLE Chat Draft',
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
-      home: const ChatListPage(),
+  static const AndroidNotificationChannel _androidChannel =
+      AndroidNotificationChannel(
+        'meshchat_messages',
+        'MeshChat Messages',
+        description: 'Notificări pentru mesaje primite prin Nearby',
+        importance: Importance.high,
+      );
+
+  static Future<void> init() async {
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const initSettings = InitializationSettings(android: androidInit);
+
+    await _plugin.initialize(initSettings);
+
+    final androidPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    await androidPlugin?.createNotificationChannel(_androidChannel);
+  }
+
+  static Future<bool> requestPermission() async {
+    if (!Platform.isAndroid) return true;
+
+    final status = await Permission.notification.request();
+    return status.isGranted;
+  }
+
+  static Future<void> showMessage({
+    required String title,
+    required String body,
+  }) async {
+    const androidDetails = AndroidNotificationDetails(
+      'meshchat_messages',
+      'MeshChat Messages',
+      channelDescription: 'Notificări pentru mesaje primite prin Nearby',
+      importance: Importance.high,
+      priority: Priority.high,
+      icon: '@mipmap/ic_launcher',
+    );
+
+    const details = NotificationDetails(android: androidDetails);
+
+    await _plugin.show(
+      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      title,
+      body,
+      details,
     );
   }
 }
 
-class ChatThread {
-  final String id;
-  final String title;
-  final String? deviceId;
-  bool persistent;
-  List<ChatMessage> messages;
+// --- PERMISIUNI NEARBY ---
+Future<bool> requestNearbyPermissions() async {
+  if (!Platform.isAndroid) return true;
 
-  ChatThread({
-    required this.id,
-    required this.title,
-    required this.deviceId,
-    required this.persistent,
-    required this.messages,
-  });
+  final statuses = await [
+    Permission.locationWhenInUse,
+    Permission.bluetoothScan,
+    Permission.bluetoothAdvertise,
+    Permission.bluetoothConnect,
+    Permission.nearbyWifiDevices,
+  ].request();
 
-  Map<String, dynamic> toJson() => {
-    'id': id,
-    'title': title,
-    'deviceId': deviceId,
-    'persistent': persistent,
-    'messages': messages.map((e) => e.toJson()).toList(),
-  };
+  final locationOk = statuses[Permission.locationWhenInUse]?.isGranted ?? false;
+  final scanOk = statuses[Permission.bluetoothScan]?.isGranted ?? true;
+  final advertiseOk =
+      statuses[Permission.bluetoothAdvertise]?.isGranted ?? true;
+  final connectOk = statuses[Permission.bluetoothConnect]?.isGranted ?? true;
+  final nearbyWifiOk =
+      statuses[Permission.nearbyWifiDevices]?.isGranted ?? true;
 
-  factory ChatThread.fromJson(Map<String, dynamic> json) => ChatThread(
-    id: json['id'],
-    title: json['title'],
-    deviceId: json['deviceId'],
-    persistent: json['persistent'] ?? false,
-    messages: (json['messages'] as List<dynamic>? ?? [])
-        .map((e) => ChatMessage.fromJson(Map<String, dynamic>.from(e)))
-        .toList(),
-  );
+  debugPrint("Nearby permissions:");
+  debugPrint("LOCATION: $locationOk");
+  debugPrint("BT SCAN: $scanOk");
+  debugPrint("BT ADVERTISE: $advertiseOk");
+  debugPrint("BT CONNECT: $connectOk");
+  debugPrint("NEARBY WIFI: $nearbyWifiOk");
+
+  return locationOk && scanOk && advertiseOk && connectOk && nearbyWifiOk;
 }
 
+Future<bool> requestMicrophonePermission() async {
+  if (!Platform.isAndroid && !Platform.isIOS) return true;
+
+  final status = await Permission.microphone.request();
+  return status.isGranted;
+}
+
+// --- MODELE DE DATE ---
 class ChatMessage {
   final String id;
   final String text;
   final bool isMine;
   final DateTime timestamp;
+  final String type;
+  final String? fileName;
+  final String? filePath;
 
   ChatMessage({
     required this.id,
     required this.text,
     required this.isMine,
     required this.timestamp,
+    this.type = "text",
+    this.fileName,
+    this.filePath,
   });
+
+  bool get isFile => type == "file";
+  bool get isVoice => type == "voice";
 
   Map<String, dynamic> toJson() => {
     'id': id,
     'text': text,
     'isMine': isMine,
     'timestamp': timestamp.toIso8601String(),
+    'type': type,
+    'fileName': fileName,
+    'filePath': filePath,
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -88,374 +166,1905 @@ class ChatMessage {
     text: json['text'],
     isMine: json['isMine'],
     timestamp: DateTime.parse(json['timestamp']),
+    type: json['type'] ?? "text",
+    fileName: json['fileName'],
+    filePath: json['filePath'],
   );
 }
 
-class LocalStore {
-  static const _threadsKey = 'chat_threads';
+class ChatThread {
+  final String id;
+  String title;
 
-  static Future<List<ChatThread>> loadThreads() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_threadsKey);
-    if (raw == null || raw.isEmpty) return [];
-    final decoded = jsonDecode(raw) as List<dynamic>;
-    return decoded
-        .map((e) => ChatThread.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
-  }
+  /// Acesta este ID-ul permanent al celuilalt telefon, nu endpointId-ul Nearby.
+  final String? deviceId;
+  List<ChatMessage> messages;
 
-  static Future<void> saveThreads(List<ChatThread> threads) async {
-    final prefs = await SharedPreferences.getInstance();
-    final data = jsonEncode(threads.map((e) => e.toJson()).toList());
-    await prefs.setString(_threadsKey, data);
-  }
+  ChatThread({
+    required this.id,
+    required this.title,
+    this.deviceId,
+    required this.messages,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'deviceId': deviceId,
+    'messages': messages.map((e) => e.toJson()).toList(),
+  };
+
+  factory ChatThread.fromJson(Map<String, dynamic> json) => ChatThread(
+    id: json['id'],
+    title: json['title'],
+    deviceId: json['deviceId'],
+    messages: (json['messages'] as List)
+        .map((e) => ChatMessage.fromJson(e))
+        .toList(),
+  );
 }
 
-class BleChatService {
-  BluetoothDevice? _device;
-  BluetoothCharacteristic? _txCharacteristic;
-  BluetoothCharacteristic? _rxCharacteristic;
-  StreamSubscription<List<int>>? _notifySub;
+class NearbyDevice {
+  final String endpointId;
+  final String nodeId;
+  final String displayName;
 
-  final _incomingController = StreamController<String>.broadcast();
-  final _connectionStateController = StreamController<bool>.broadcast();
+  NearbyDevice({
+    required this.endpointId,
+    required this.nodeId,
+    required this.displayName,
+  });
+}
 
-  Stream<String> get incomingMessages => _incomingController.stream;
-  Stream<bool> get connectionState => _connectionStateController.stream;
+class NearbyConnectionRequest {
+  final String endpointId;
+  final String nodeId;
+  final String displayName;
 
-  BluetoothDevice? get device => _device;
+  NearbyConnectionRequest({
+    required this.endpointId,
+    required this.nodeId,
+    required this.displayName,
+  });
+}
 
-  Future<void> connectToDevice(BluetoothDevice device) async {
-    _device = device;
+enum NearbyIncomingType { text, file, voice }
 
-    await device.connect(timeout: const Duration(seconds: 12));
+class NearbyIncomingMessage {
+  final String endpointId;
+  final String nodeId;
+  final String displayName;
+  final String text;
+  final NearbyIncomingType type;
+  final String? filePath;
+  final String? fileName;
 
-    final services = await device.discoverServices();
-    BluetoothCharacteristic? tx;
-    BluetoothCharacteristic? rx;
+  NearbyIncomingMessage({
+    required this.endpointId,
+    required this.nodeId,
+    required this.displayName,
+    required this.text,
+    required this.type,
+    this.filePath,
+    this.fileName,
+  });
+}
 
-    for (final service in services) {
-      if (service.uuid.str128.toLowerCase() == kServiceUuid.toLowerCase()) {
-        for (final c in service.characteristics) {
-          final uuid = c.uuid.str128.toLowerCase();
-          if (uuid == kTxCharacteristicUuid.toLowerCase()) {
-            tx = c;
-          }
-          if (uuid == kRxCharacteristicUuid.toLowerCase()) {
-            rx = c;
-          }
-        }
+class ParsedEndpointName {
+  final String displayName;
+  final String nodeId;
+
+  ParsedEndpointName({required this.displayName, required this.nodeId});
+}
+
+ParsedEndpointName parseEndpointName(String raw) {
+  if (!raw.contains(kEndpointSeparator)) {
+    return ParsedEndpointName(displayName: raw, nodeId: raw);
+  }
+
+  final parts = raw.split(kEndpointSeparator);
+  final nodeId = parts.removeLast();
+  final displayName = parts.join(kEndpointSeparator).trim();
+
+  return ParsedEndpointName(
+    displayName: displayName.isEmpty ? "MeshChat" : displayName,
+    nodeId: nodeId,
+  );
+}
+
+// --- PROVIDER SETĂRI / ISTORIC ---
+class SettingsProvider extends ChangeNotifier {
+  final SharedPreferences _prefs;
+
+  bool _isDarkMode = true;
+  bool _saveHistory = true;
+  bool _notificationsEnabled = true;
+  Color _accentColor = const Color(0xFF0052D4);
+  String _alias = "MeshChat";
+  List<ChatThread> _threads = [];
+
+  SettingsProvider(this._prefs) {
+    _isDarkMode = _prefs.getBool('dark_mode') ?? true;
+    _saveHistory = _prefs.getBool('save_history') ?? true;
+    _notificationsEnabled = _prefs.getBool('notifications_enabled') ?? true;
+    _accentColor = Color(_prefs.getInt('accent_color') ?? 0xFF0052D4);
+    _alias = _prefs.getString('alias') ?? "MeshChat";
+    _loadThreads();
+  }
+
+  bool get isDarkMode => _isDarkMode;
+  bool get saveHistory => _saveHistory;
+  bool get notificationsEnabled => _notificationsEnabled;
+  Color get accentColor => _accentColor;
+  String get alias => _alias;
+  List<ChatThread> get threads => _threads;
+
+  void updateAlias(String value) {
+    final clean = value.trim();
+    if (clean.isEmpty) return;
+
+    _alias = clean;
+    _prefs.setString('alias', clean);
+    notifyListeners();
+  }
+
+  void toggleTheme(bool val) {
+    _isDarkMode = val;
+    _prefs.setBool('dark_mode', val);
+    notifyListeners();
+  }
+
+  void toggleSaveHistory(bool val) {
+    _saveHistory = val;
+    _prefs.setBool('save_history', val);
+    notifyListeners();
+  }
+
+  Future<void> toggleNotifications(bool val) async {
+    if (val) {
+      final ok = await AppNotifications.requestPermission();
+      if (!ok) return;
+    }
+
+    _notificationsEnabled = val;
+    _prefs.setBool('notifications_enabled', val);
+    notifyListeners();
+  }
+
+  void updateAccent(Color c) {
+    _accentColor = c;
+    _prefs.setInt('accent_color', c.value);
+    notifyListeners();
+  }
+
+  void _loadThreads() {
+    final raw = _prefs.getString('chat_threads');
+
+    if (raw != null) {
+      try {
+        final List decoded = jsonDecode(raw);
+        _threads = decoded.map((e) => ChatThread.fromJson(e)).toList();
+      } catch (e) {
+        debugPrint("Eroare load threads: $e");
+        _threads = [];
       }
     }
-
-    if (tx == null || rx == null) {
-      throw Exception('Nu am găsit caracteristicile BLE necesare.');
-    }
-
-    _txCharacteristic = tx;
-    _rxCharacteristic = rx;
-
-    await _rxCharacteristic!.setNotifyValue(true);
-    _notifySub?.cancel();
-    _notifySub = _rxCharacteristic!.lastValueStream.listen((value) {
-      if (value.isEmpty) return;
-      final text = utf8.decode(value, allowMalformed: true);
-      _incomingController.add(text);
-    });
-
-    _connectionStateController.add(true);
   }
 
-  Future<void> sendMessage(String message) async {
-    final tx = _txCharacteristic;
-    if (tx == null) {
-      throw Exception('Nu există conexiune BLE activă.');
-    }
+  void _persistThreads() {
+    if (!_saveHistory) return;
 
-    final bytes = utf8.encode(message);
-    await tx.write(bytes, withoutResponse: false);
+    _prefs.setString(
+      'chat_threads',
+      jsonEncode(_threads.map((e) => e.toJson()).toList()),
+    );
   }
 
-  Future<void> disconnect() async {
-    await _notifySub?.cancel();
-    _notifySub = null;
-
+  ChatThread? threadById(String id) {
     try {
-      await _device?.disconnect();
-    } catch (_) {}
-
-    _device = null;
-    _txCharacteristic = null;
-    _rxCharacteristic = null;
-    _connectionStateController.add(false);
+      return _threads.firstWhere((t) => t.id == id);
+    } catch (_) {
+      return null;
+    }
   }
 
-  void dispose() {
-    _notifySub?.cancel();
-    _incomingController.close();
-    _connectionStateController.close();
-  }
-}
-
-class ChatListPage extends StatefulWidget {
-  const ChatListPage({super.key});
-
-  @override
-  State<ChatListPage> createState() => _ChatListPageState();
-}
-
-class _ChatListPageState extends State<ChatListPage> {
-  final _uuid = const Uuid();
-  List<ChatThread> _threads = [];
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
+  ChatThread? threadByDeviceId(String deviceId) {
+    try {
+      return _threads.firstWhere((t) => t.deviceId == deviceId);
+    } catch (_) {
+      return null;
+    }
   }
 
-  Future<void> _load() async {
-    final threads = await LocalStore.loadThreads();
-    setState(() {
-      _threads = threads;
-      _loading = false;
-    });
-  }
+  ChatThread getOrCreateThreadForDevice({
+    required String deviceId,
+    required String title,
+  }) {
+    final existing = threadByDeviceId(deviceId);
 
-  Future<void> _persist() async {
-    final threadsToSave = _threads
-        .where((t) => t.persistent)
-        .map((t) => t)
-        .toList();
-    await LocalStore.saveThreads(threadsToSave);
-  }
+    if (existing != null) {
+      if (existing.title != title && title.trim().isNotEmpty) {
+        existing.title = title;
+        _persistThreads();
+        notifyListeners();
+      }
+      return existing;
+    }
 
-  Future<void> _createManualChat() async {
     final thread = ChatThread(
-      id: _uuid.v4(),
-      title: 'Chat local',
-      deviceId: null,
-      persistent: false,
+      id: const Uuid().v4(),
+      title: title,
+      deviceId: deviceId,
       messages: [],
     );
-    setState(() => _threads.insert(0, thread));
-    await _persist();
+
+    _threads.insert(0, thread);
+    _persistThreads();
+    notifyListeners();
+    return thread;
   }
 
-  Future<void> _openScanner() async {
-    final result = await Navigator.push<ChatThread>(
-      context,
-      MaterialPageRoute(builder: (_) => const DeviceScannerPage()),
-    );
+  void saveThread(ChatThread thread) {
+    if (!_saveHistory) return;
 
-    if (result != null) {
-      setState(() {
-        _threads.removeWhere((t) => t.id == result.id);
-        _threads.insert(0, result);
-      });
-      await _persist();
+    _threads.removeWhere((t) => t.id == thread.id);
+    _threads.insert(0, thread);
+    _persistThreads();
+    notifyListeners();
+  }
+
+  void addMessageToThreadId(String threadId, ChatMessage message) {
+    final thread = threadById(threadId);
+    if (thread == null) return;
+
+    thread.messages.add(message);
+    saveThread(thread);
+  }
+
+  ChatThread addIncomingMessage({
+    required String deviceId,
+    required String title,
+    required ChatMessage message,
+  }) {
+    final thread = getOrCreateThreadForDevice(deviceId: deviceId, title: title);
+    thread.messages.add(message);
+    saveThread(thread);
+    return thread;
+  }
+
+  void clearChats() {
+    _threads.clear();
+    _prefs.remove('chat_threads');
+    notifyListeners();
+  }
+}
+
+// --- NEARBY GLOBAL PROVIDER ---
+class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
+  final SharedPreferences _prefs;
+  final Strategy _strategy = Strategy.P2P_CLUSTER;
+
+  final Map<String, NearbyDevice> _devicesByEndpoint = {};
+  final Map<String, String> _connectedEndpointByNodeId = {};
+  final Map<int, String> _pendingFileNames = {};
+  final Map<int, String> _pendingFileUris = {};
+  final Map<int, String> _pendingFileKinds = {};
+
+  final StreamController<NearbyIncomingMessage> _incomingController =
+      StreamController<NearbyIncomingMessage>.broadcast();
+  final StreamController<NearbyConnectionRequest> _connectionRequestController =
+      StreamController<NearbyConnectionRequest>.broadcast();
+
+  bool _isAdvertising = false;
+  bool _isDiscovering = false;
+  bool _isStarting = false;
+  String _status = "Nearby nu a pornit încă.";
+
+  late final String _localNodeId;
+
+  NearbyProvider(this._prefs) {
+    WidgetsBinding.instance.addObserver(this);
+    _localNodeId = _prefs.getString('local_node_id') ?? const Uuid().v4();
+    _prefs.setString('local_node_id', _localNodeId);
+  }
+
+  String get localNodeId => _localNodeId;
+  bool get isAdvertising => _isAdvertising;
+  bool get isDiscovering => _isDiscovering;
+  String get status => _status;
+
+  List<NearbyDevice> get discoveredDevices =>
+      _devicesByEndpoint.values.toList();
+  Stream<NearbyIncomingMessage> get incomingMessages =>
+      _incomingController.stream;
+  Stream<NearbyConnectionRequest> get connectionRequests =>
+      _connectionRequestController.stream;
+
+  String advertisingName(String alias) =>
+      "$alias$kEndpointSeparator$_localNodeId";
+
+  bool isDeviceOnline(String? nodeId) {
+    if (nodeId == null) return false;
+    return _devicesByEndpoint.values.any((d) => d.nodeId == nodeId) ||
+        _connectedEndpointByNodeId.containsKey(nodeId);
+  }
+
+  bool isDeviceConnected(String? nodeId) {
+    if (nodeId == null) return false;
+    return _connectedEndpointByNodeId.containsKey(nodeId);
+  }
+
+  NearbyDevice? deviceByNodeId(String? nodeId) {
+    if (nodeId == null) return null;
+    for (final device in _devicesByEndpoint.values) {
+      if (device.nodeId == nodeId) return device;
+    }
+    return null;
+  }
+
+  NearbyDevice? deviceByEndpointId(String endpointId) {
+    return _devicesByEndpoint[endpointId];
+  }
+
+  Future<void> start() async {
+    if (_isStarting) return;
+    _isStarting = true;
+
+    final ok = await requestNearbyPermissions();
+
+    if (!ok) {
+      _status =
+          "Permisiuni refuzate. Activează Location / Nearby devices / Wi-Fi.";
+      _isStarting = false;
+      notifyListeners();
+      return;
+    }
+
+    await startAdvertising();
+    await startDiscovery();
+
+    _isStarting = false;
+  }
+
+  Future<void> startAdvertising() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final alias = prefs.getString('alias') ?? "MeshChat";
+
+      final result = await Nearby().startAdvertising(
+        advertisingName(alias),
+        _strategy,
+        serviceId: kNearbyServiceId,
+        onConnectionInitiated: _onConnectionInitiated,
+        onConnectionResult: _onConnectionResult,
+        onDisconnected: _onDisconnected,
+      );
+
+      _isAdvertising = result;
+      _status = result
+          ? "Advertising pornit ca $alias."
+          : "Advertising Nearby eșuat.";
+      notifyListeners();
+    } catch (e) {
+      _isAdvertising = false;
+      _status = "Eroare advertising: $e";
+      notifyListeners();
     }
   }
 
-  Future<void> _deleteThread(ChatThread thread) async {
-    setState(() {
-      _threads.removeWhere((t) => t.id == thread.id);
-    });
-    await _persist();
+  Future<void> startDiscovery() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final alias = prefs.getString('alias') ?? "MeshChat";
+
+      final result = await Nearby().startDiscovery(
+        advertisingName(alias),
+        _strategy,
+        serviceId: kNearbyServiceId,
+        onEndpointFound: (endpointId, endpointName, serviceId) {
+          final parsed = parseEndpointName(endpointName);
+
+          if (parsed.nodeId == _localNodeId) return;
+
+          _devicesByEndpoint[endpointId] = NearbyDevice(
+            endpointId: endpointId,
+            nodeId: parsed.nodeId,
+            displayName: parsed.displayName,
+          );
+
+          _status = "Găsit: ${parsed.displayName}";
+          notifyListeners();
+        },
+        onEndpointLost: (endpointId) {
+          final device = _devicesByEndpoint.remove(endpointId);
+          if (device != null) {
+            _connectedEndpointByNodeId.remove(device.nodeId);
+          }
+          notifyListeners();
+        },
+      );
+
+      _isDiscovering = result;
+      if (result) _status = "Discovery pornit. Caut alte telefoane...";
+      notifyListeners();
+    } catch (e) {
+      _isDiscovering = false;
+      _status = "Eroare discovery: $e";
+      notifyListeners();
+    }
   }
 
-  Future<void> _togglePersistence(ChatThread thread, bool value) async {
-    setState(() {
-      thread.persistent = value;
-    });
-    await _persist();
-  }
+  void _onConnectionInitiated(
+    String endpointId,
+    ConnectionInfo connectionInfo,
+  ) {
+    final parsed = parseEndpointName(connectionInfo.endpointName);
 
-  Future<void> _openThread(ChatThread thread) async {
-    final updated = await Navigator.push<ChatThread>(
-      context,
-      MaterialPageRoute(builder: (_) => ChatRoomPage(initialThread: thread)),
+    _devicesByEndpoint[endpointId] = NearbyDevice(
+      endpointId: endpointId,
+      nodeId: parsed.nodeId,
+      displayName: parsed.displayName,
     );
 
-    if (updated != null) {
-      final index = _threads.indexWhere((t) => t.id == updated.id);
-      if (index != -1) {
-        setState(() {
-          _threads[index] = updated;
-        });
-        await _persist();
+    _status = "Cerere conexiune de la ${parsed.displayName}.";
+    notifyListeners();
+
+    _connectionRequestController.add(
+      NearbyConnectionRequest(
+        endpointId: endpointId,
+        nodeId: parsed.nodeId,
+        displayName: parsed.displayName,
+      ),
+    );
+  }
+
+  Future<void> acceptConnection(String endpointId) async {
+    try {
+      await Nearby().acceptConnection(
+        endpointId,
+        onPayLoadRecieved: _onPayloadReceived,
+        onPayloadTransferUpdate: (endpointId, update) {
+          debugPrint("Payload update from $endpointId: ${update.status}");
+        },
+      );
+
+      final device = _devicesByEndpoint[endpointId];
+      if (device != null) {
+        _status = "Conexiune acceptată cu ${device.displayName}.";
       }
+      notifyListeners();
+    } catch (e) {
+      _status = "Eroare acceptare conexiune: $e";
+      notifyListeners();
     }
   }
+
+  Future<void> rejectConnection(String endpointId) async {
+    try {
+      await Nearby().rejectConnection(endpointId);
+      _status = "Conexiune respinsă.";
+      notifyListeners();
+    } catch (e) {
+      _status = "Eroare respingere conexiune: $e";
+      notifyListeners();
+    }
+  }
+
+  void _onConnectionResult(String endpointId, Status status) {
+    final device = _devicesByEndpoint[endpointId];
+    final name = device?.displayName ?? endpointId;
+
+    if (status == Status.CONNECTED) {
+      if (device != null) {
+        _connectedEndpointByNodeId[device.nodeId] = endpointId;
+      }
+      _status = "Conectat cu $name.";
+    } else {
+      if (device != null) {
+        _connectedEndpointByNodeId.remove(device.nodeId);
+      }
+      _status = "Conexiune eșuată cu $name: $status";
+    }
+
+    notifyListeners();
+  }
+
+  void _onDisconnected(String endpointId) {
+    final device = _devicesByEndpoint[endpointId];
+    if (device != null) {
+      _connectedEndpointByNodeId.remove(device.nodeId);
+      _status = "Deconectat: ${device.displayName}";
+    } else {
+      _status = "Deconectat: $endpointId";
+    }
+    notifyListeners();
+  }
+
+  Future<void> connectToDevice(String nodeId) async {
+    final device = deviceByNodeId(nodeId);
+
+    if (device == null) {
+      _status = "Device-ul nu este online sau nu a fost descoperit încă.";
+      notifyListeners();
+      return;
+    }
+
+    try {
+      _status = "Cer conexiune cu ${device.displayName}...";
+      notifyListeners();
+
+      await Nearby().requestConnection(
+        advertisingName(_prefs.getString('alias') ?? "MeshChat"),
+        device.endpointId,
+        onConnectionInitiated: _onConnectionInitiated,
+        onConnectionResult: _onConnectionResult,
+        onDisconnected: _onDisconnected,
+      );
+    } catch (e) {
+      _status = "Eroare conectare: $e";
+      notifyListeners();
+    }
+  }
+
+  Future<void> disconnectDevice(String nodeId) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) return;
+
+    try {
+      await Nearby().disconnectFromEndpoint(endpointId);
+    } catch (_) {
+      // Unele versiuni ale pluginului pot arunca eroare dacă endpointul este deja închis.
+    }
+
+    _connectedEndpointByNodeId.remove(nodeId);
+    _status = "Deconectat.";
+    notifyListeners();
+  }
+
+  Future<void> restartNearby() async {
+    try {
+      await Nearby().stopAdvertising();
+      await Nearby().stopDiscovery();
+    } catch (_) {}
+
+    _devicesByEndpoint.clear();
+    _connectedEndpointByNodeId.clear();
+    _isAdvertising = false;
+    _isDiscovering = false;
+    _status = "Restart Nearby...";
+    notifyListeners();
+
+    await Future.delayed(const Duration(milliseconds: 500));
+    await start();
+  }
+
+  Future<void> _saveReceivedFileIfReady({
+    required int payloadId,
+    required String endpointId,
+  }) async {
+    final fileName = _pendingFileNames[payloadId];
+    final fileUri = _pendingFileUris[payloadId];
+
+    if (fileName == null || fileUri == null) return;
+
+    final dir = await getExternalStorageDirectory();
+
+    if (dir == null) {
+      debugPrint("Nu am putut găsi directorul de salvare.");
+      return;
+    }
+
+    final kind = _pendingFileKinds[payloadId] ?? "file";
+    final safeName = fileName.replaceAll(RegExp(r'[\/:*?"<>|]'), '_');
+    final destinationPath = "${dir.path}/$safeName";
+
+    final copied = await Nearby().copyFileAndDeleteOriginal(
+      fileUri,
+      destinationPath,
+    );
+
+    final device = _devicesByEndpoint[endpointId];
+    final nodeId = device?.nodeId ?? endpointId;
+    final displayName = device?.displayName ?? endpointId;
+
+    if (copied) {
+      _incomingController.add(
+        NearbyIncomingMessage(
+          endpointId: endpointId,
+          nodeId: nodeId,
+          displayName: displayName,
+          text: kind == "voice"
+              ? "🎤 Mesaj vocal"
+              : "📎 Fișier primit: $safeName",
+          type: kind == "voice"
+              ? NearbyIncomingType.voice
+              : NearbyIncomingType.file,
+          filePath: destinationPath,
+          fileName: safeName,
+        ),
+      );
+    } else {
+      debugPrint("Copierea fișierului primit a eșuat.");
+    }
+
+    _pendingFileNames.remove(payloadId);
+    _pendingFileUris.remove(payloadId);
+    _pendingFileKinds.remove(payloadId);
+  }
+
+  void _onPayloadReceived(String endpointId, Payload payload) {
+    final device = _devicesByEndpoint[endpointId];
+    final nodeId = device?.nodeId ?? endpointId;
+    final displayName = device?.displayName ?? endpointId;
+
+    if (payload.type == PayloadType.BYTES) {
+      final bytes = payload.bytes;
+      if (bytes == null) return;
+
+      final text = utf8.decode(bytes, allowMalformed: true);
+
+      if (text.startsWith("__FILE__:")) {
+        final raw = text.replaceFirst("__FILE__:", "");
+
+        try {
+          final data = jsonDecode(raw) as Map<String, dynamic>;
+          final payloadId = data["payloadId"] as int;
+          final fileName = data["fileName"] as String;
+          final kind = (data["kind"] as String?) ?? "file";
+
+          _pendingFileNames[payloadId] = fileName;
+          _pendingFileKinds[payloadId] = kind;
+          _saveReceivedFileIfReady(
+            payloadId: payloadId,
+            endpointId: endpointId,
+          );
+        } catch (e) {
+          debugPrint("Eroare metadata fișier: $e");
+        }
+
+        return;
+      }
+
+      _incomingController.add(
+        NearbyIncomingMessage(
+          endpointId: endpointId,
+          nodeId: nodeId,
+          displayName: displayName,
+          text: text,
+          type: NearbyIncomingType.text,
+        ),
+      );
+
+      return;
+    }
+
+    if (payload.type == PayloadType.FILE) {
+      final uri = payload.uri;
+      if (uri == null) {
+        debugPrint("Payload FILE fără uri.");
+        return;
+      }
+
+      _pendingFileUris[payload.id] = uri;
+      _saveReceivedFileIfReady(payloadId: payload.id, endpointId: endpointId);
+    }
+  }
+
+  Future<bool> sendTextToDevice(String nodeId, String text) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) {
+      _status = "Device-ul nu este conectat.";
+      notifyListeners();
+      return false;
+    }
+
+    try {
+      await Nearby().sendBytesPayload(
+        endpointId,
+        Uint8List.fromList(utf8.encode(text)),
+      );
+      return true;
+    } catch (e) {
+      _status = "Eroare trimitere Nearby: $e";
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<String?> sendFileToDevice(String nodeId) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) {
+      _status = "Device-ul nu este conectat.";
+      notifyListeners();
+      return null;
+    }
+
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      allowMultiple: false,
+      withData: false,
+    );
+
+    if (result == null || result.files.isEmpty) return null;
+
+    final picked = result.files.single;
+    final path = picked.path;
+
+    if (path == null) {
+      _status = "Nu pot accesa calea fișierului.";
+      notifyListeners();
+      return null;
+    }
+
+    return sendPathPayloadToDevice(
+      nodeId: nodeId,
+      path: path,
+      fileName: picked.name,
+      size: picked.size,
+      kind: "file",
+    );
+  }
+
+  Future<String?> sendPathPayloadToDevice({
+    required String nodeId,
+    required String path,
+    required String fileName,
+    required int size,
+    String kind = "file",
+  }) async {
+    final endpointId = _connectedEndpointByNodeId[nodeId];
+    if (endpointId == null) {
+      _status = "Device-ul nu este conectat.";
+      notifyListeners();
+      return null;
+    }
+
+    final sourceFile = File(path);
+    if (!await sourceFile.exists()) {
+      _status = "Fișierul nu există local.";
+      notifyListeners();
+      return null;
+    }
+
+    try {
+      final payloadId = await Nearby().sendFilePayload(endpointId, path);
+
+      final metadata = {
+        "payloadId": payloadId,
+        "fileName": fileName,
+        "size": size,
+        "kind": kind,
+      };
+
+      await Nearby().sendBytesPayload(
+        endpointId,
+        Uint8List.fromList(utf8.encode("__FILE__:${jsonEncode(metadata)}")),
+      );
+
+      return path;
+    } catch (e) {
+      _status = kind == "voice"
+          ? "Eroare trimitere mesaj vocal: $e"
+          : "Eroare trimitere fișier: $e";
+      notifyListeners();
+      return null;
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      start();
+    }
+
+    // Nu oprim Nearby la paused/inactive. Astfel conexiunea are șanse să rămână vie
+    // când utilizatorul minimizează aplicația. Pentru garanție reală pe Android,
+    // ai nevoie de foreground service nativ.
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _incomingController.close();
+    _connectionRequestController.close();
+    Nearby().stopAdvertising();
+    Nearby().stopDiscovery();
+    super.dispose();
+  }
+}
+
+// --- APP ENTRY ---
+class MeshChatApp extends StatelessWidget {
+  const MeshChatApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Chat-uri BLE'),
-        actions: [
-          IconButton(
-            onPressed: _openScanner,
-            icon: const Icon(Icons.bluetooth_searching),
-            tooltip: 'Scanează device-uri',
-          ),
-          IconButton(
-            onPressed: _createManualChat,
-            icon: const Icon(Icons.add_comment_outlined),
-            tooltip: 'Chat local',
-          ),
-        ],
+    final settings = Provider.of<SettingsProvider>(context);
+
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      themeMode: settings.isDarkMode ? ThemeMode.dark : ThemeMode.light,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: settings.accentColor,
+        brightness: Brightness.light,
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _threads.isEmpty
-          ? const Center(
-              child: Text('Nu există chat-uri. Scanează un device BLE.'),
-            )
-          : ListView.builder(
-              itemCount: _threads.length,
-              itemBuilder: (_, index) {
-                final thread = _threads[index];
-                final last = thread.messages.isNotEmpty
-                    ? thread.messages.last.text
-                    : 'Fără mesaje';
-                return Dismissible(
-                  key: ValueKey(thread.id),
-                  background: Container(color: Colors.red),
-                  onDismissed: (_) => _deleteThread(thread),
-                  child: ListTile(
-                    title: Text(thread.title),
-                    subtitle: Text(
-                      last,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    leading: const Icon(Icons.chat_bubble_outline),
-                    trailing: Switch(
-                      value: thread.persistent,
-                      onChanged: (v) => _togglePersistence(thread, v),
-                    ),
-                    onTap: () => _openThread(thread),
-                  ),
-                );
-              },
-            ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openScanner,
-        icon: const Icon(Icons.search),
-        label: const Text('Scan BLE'),
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorSchemeSeed: settings.accentColor,
+        scaffoldBackgroundColor: const Color(0xFF0F1115),
       ),
+      home: const MainShell(),
     );
   }
 }
 
-class DeviceScannerPage extends StatefulWidget {
-  const DeviceScannerPage({super.key});
+// --- NAVIGARE + LISTENER GLOBAL PENTRU POPUPURI ---
+class MainShell extends StatefulWidget {
+  const MainShell({super.key});
 
   @override
-  State<DeviceScannerPage> createState() => _DeviceScannerPageState();
+  State<MainShell> createState() => _MainShellState();
 }
 
-class _DeviceScannerPageState extends State<DeviceScannerPage> {
-  final _uuid = const Uuid();
-  StreamSubscription<List<ScanResult>>? _scanSub;
-  final Map<String, ScanResult> _results = {};
-  bool _isScanning = false;
+class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
+  int _idx = 1;
+  final PageController _pageController = PageController(initialPage: 1);
+
+  StreamSubscription<NearbyIncomingMessage>? _incomingSub;
+  StreamSubscription<NearbyConnectionRequest>? _connectionRequestSub;
+  bool _isAppInForeground = true;
 
   @override
   void initState() {
     super.initState();
-    _startScan();
-  }
+    WidgetsBinding.instance.addObserver(this);
 
-  Future<void> _startScan() async {
-    setState(() => _isScanning = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final nearby = Provider.of<NearbyProvider>(context, listen: false);
 
-    _scanSub?.cancel();
-    _results.clear();
+      _connectionRequestSub = nearby.connectionRequests.listen((request) {
+        _showConnectionRequestDialog(request);
+      });
 
-    _scanSub = FlutterBluePlus.scanResults.listen((results) {
-      for (final r in results) {
-        _results[r.device.remoteId.str] = r;
-      }
-      if (mounted) setState(() {});
+      _incomingSub = nearby.incomingMessages.listen((incoming) {
+        _saveIncomingMessageDirectly(incoming);
+      });
     });
-
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
-    await Future.delayed(const Duration(seconds: 8));
-    if (mounted) {
-      setState(() => _isScanning = false);
-    }
-  }
-
-  Future<void> _stopScan() async {
-    await FlutterBluePlus.stopScan();
-    await _scanSub?.cancel();
-    _scanSub = null;
-    if (mounted) {
-      setState(() => _isScanning = false);
-    }
   }
 
   @override
   void dispose() {
-    _stopScan();
+    WidgetsBinding.instance.removeObserver(this);
+    _incomingSub?.cancel();
+    _connectionRequestSub?.cancel();
+    _pageController.dispose();
     super.dispose();
   }
 
-  String _displayName(ScanResult r) {
-    final p = r.device.platformName.trim();
-    if (p.isNotEmpty) return p;
-    final a = r.advertisementData.advName.trim();
-    if (a.isNotEmpty) return a;
-    return 'Unknown device';
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _isAppInForeground = state == AppLifecycleState.resumed;
+  }
+
+  void _goToPage(int i) {
+    _pageController.animateToPage(
+      i,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+    );
+  }
+
+  Future<void> _showConnectionRequestDialog(
+    NearbyConnectionRequest request,
+  ) async {
+    if (!mounted) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+    final accept = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text("Cerere conexiune Nearby"),
+          content: Text("${request.displayName} vrea să se conecteze la tine."),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text("Respinge"),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text("Acceptă"),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (accept == true) {
+      await nearby.acceptConnection(request.endpointId);
+      if (!mounted) return;
+      Provider.of<SettingsProvider>(
+        context,
+        listen: false,
+      ).getOrCreateThreadForDevice(
+        deviceId: request.nodeId,
+        title: request.displayName,
+      );
+    } else {
+      await nearby.rejectConnection(request.endpointId);
+    }
+  }
+
+  void _saveIncomingMessageDirectly(NearbyIncomingMessage incoming) {
+    if (!mounted) return;
+
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+
+    settings.addIncomingMessage(
+      deviceId: incoming.nodeId,
+      title: incoming.displayName,
+      message: ChatMessage(
+        id: const Uuid().v4(),
+        text: incoming.text,
+        isMine: false,
+        timestamp: DateTime.now(),
+        type: incoming.type == NearbyIncomingType.voice
+            ? "voice"
+            : incoming.type == NearbyIncomingType.file
+            ? "file"
+            : "text",
+        fileName: incoming.fileName,
+        filePath: incoming.filePath,
+      ),
+    );
+
+    final notificationBody = incoming.type == NearbyIncomingType.voice
+        ? "Mesaj vocal nou"
+        : incoming.type == NearbyIncomingType.file
+        ? "Fișier primit: ${incoming.fileName ?? "fișier"}"
+        : incoming.text;
+
+    if (!_isAppInForeground && settings.notificationsEnabled) {
+      AppNotifications.showMessage(
+        title: incoming.displayName,
+        body: notificationBody,
+      );
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          incoming.type == NearbyIncomingType.voice
+              ? "Mesaj vocal nou de la ${incoming.displayName}"
+              : incoming.type == NearbyIncomingType.file
+              ? "Fișier primit de la ${incoming.displayName}: ${incoming.fileName ?? "fișier"}"
+              : "Mesaj nou de la ${incoming.displayName}",
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final list = _results.values.toList();
+    return Scaffold(
+      body: PageView(
+        controller: _pageController,
+        onPageChanged: (i) => setState(() => _idx = i),
+        children: [
+          const NearbyScannerPage(),
+          ChatListPage(onNewChatPressed: () => _goToPage(0)),
+          const SettingsPage(),
+        ],
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _idx,
+        onTap: _goToPage,
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.wifi_tethering),
+            label: 'Scan',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.chat_bubble_outline),
+            label: 'Chats',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings_outlined),
+            label: 'Settings',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- CHAT LIST ---
+class ChatListPage extends StatelessWidget {
+  final VoidCallback onNewChatPressed;
+
+  const ChatListPage({super.key, required this.onNewChatPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = Provider.of<SettingsProvider>(context);
+    final nearby = Provider.of<NearbyProvider>(context);
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BLE devices'),
+        title: const Text('MeshChat'),
+        actions: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Text(
+                '• ${nearby.discoveredDevices.length} online',
+                style: const TextStyle(color: Colors.green, fontSize: 12),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Column(
+              children: [
+                TextField(
+                  decoration: InputDecoration(
+                    hintText: 'Search chats...',
+                    prefixIcon: const Icon(Icons.search),
+                    filled: true,
+                    fillColor: Theme.of(context).cardColor,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Expanded(
+                  child: settings.threads.isEmpty
+                      ? const Center(
+                          child: Text(
+                            "Nu ai conversații încă.\nApasă '+ New Chat' ca să scanezi.",
+                            textAlign: TextAlign.center,
+                          ),
+                        )
+                      : ListView.builder(
+                          itemCount: settings.threads.length,
+                          itemBuilder: (context, i) {
+                            final t = settings.threads[i];
+                            final online = nearby.isDeviceOnline(t.deviceId);
+                            final connected = nearby.isDeviceConnected(
+                              t.deviceId,
+                            );
+
+                            return ListTile(
+                              leading: Stack(
+                                children: [
+                                  CircleAvatar(
+                                    backgroundColor: settings.accentColor,
+                                    child: Text(
+                                      t.title.isNotEmpty
+                                          ? t.title[0].toUpperCase()
+                                          : "?",
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                  Positioned(
+                                    right: 0,
+                                    bottom: 0,
+                                    child: Container(
+                                      width: 12,
+                                      height: 12,
+                                      decoration: BoxDecoration(
+                                        color: connected
+                                            ? Colors.green
+                                            : online
+                                            ? Colors.orange
+                                            : Colors.grey,
+                                        shape: BoxShape.circle,
+                                        border: Border.all(
+                                          color: Theme.of(
+                                            context,
+                                          ).scaffoldBackgroundColor,
+                                          width: 2,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              title: Text(t.title),
+                              subtitle: Text(
+                                t.messages.isNotEmpty
+                                    ? t.messages.last.text
+                                    : online
+                                    ? "Online"
+                                    : "Offline",
+                                maxLines: 1,
+                              ),
+                              trailing: Text(
+                                connected
+                                    ? "Connected"
+                                    : online
+                                    ? "Online"
+                                    : "Offline",
+                                style: TextStyle(
+                                  color: connected
+                                      ? Colors.green
+                                      : online
+                                      ? Colors.orange
+                                      : Colors.grey,
+                                  fontSize: 12,
+                                ),
+                              ),
+                              onTap: () => Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      ModernChatRoom(threadId: t.id),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+                const SizedBox(height: 80),
+              ],
+            ),
+          ),
+          Positioned(
+            bottom: 20,
+            left: 20,
+            right: 20,
+            child: ElevatedButton(
+              onPressed: onNewChatPressed,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: settings.accentColor,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(double.infinity, 50),
+              ),
+              child: const Text('+ New Chat'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- NEARBY SCAN PAGE ---
+class NearbyScannerPage extends StatelessWidget {
+  const NearbyScannerPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final nearby = Provider.of<NearbyProvider>(context);
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+    final entries = nearby.discoveredDevices;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Nearby Scan"),
         actions: [
           IconButton(
-            onPressed: _isScanning ? null : _startScan,
+            onPressed: nearby.restartNearby,
             icon: const Icon(Icons.refresh),
           ),
         ],
       ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Card(
+              child: ListTile(
+                leading: Icon(
+                  nearby.isAdvertising && nearby.isDiscovering
+                      ? Icons.wifi_tethering
+                      : Icons.wifi_tethering_off,
+                  color: nearby.isAdvertising && nearby.isDiscovering
+                      ? Colors.green
+                      : Colors.orange,
+                ),
+                title: Text("My name: ${settings.alias}"),
+                subtitle: Text(
+                  "${nearby.status}\nID permanent: ${nearby.localNodeId}",
+                ),
+                isThreeLine: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: nearby.startAdvertising,
+                    child: Text(
+                      nearby.isAdvertising
+                          ? "Advertising ON"
+                          : "Start Advertising",
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: nearby.startDiscovery,
+                    child: Text(
+                      nearby.isDiscovering ? "Discovery ON" : "Start Discovery",
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: entries.isEmpty
+                  ? const Center(
+                      child: Text(
+                        "Nu am găsit device-uri Nearby încă.\nRulează aplicația pe două telefoane Android reale.",
+                        textAlign: TextAlign.center,
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: entries.length,
+                      itemBuilder: (context, index) {
+                        final device = entries[index];
+                        final isConnected = nearby.isDeviceConnected(
+                          device.nodeId,
+                        );
+
+                        return Card(
+                          child: ListTile(
+                            leading: Icon(
+                              isConnected
+                                  ? Icons.check_circle
+                                  : Icons.phone_android,
+                              color: isConnected ? Colors.green : null,
+                            ),
+                            title: Text(device.displayName),
+                            subtitle: Text("Node ID: ${device.nodeId}"),
+                            trailing: ElevatedButton(
+                              onPressed: isConnected
+                                  ? null
+                                  : () async {
+                                      settings.getOrCreateThreadForDevice(
+                                        deviceId: device.nodeId,
+                                        title: device.displayName,
+                                      );
+                                      await nearby.connectToDevice(
+                                        device.nodeId,
+                                      );
+                                    },
+                              child: Text(
+                                isConnected ? "Connected" : "Connect",
+                              ),
+                            ),
+                            onTap: () {
+                              final thread = settings
+                                  .getOrCreateThreadForDevice(
+                                    deviceId: device.nodeId,
+                                    title: device.displayName,
+                                  );
+
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      ModernChatRoom(threadId: thread.id),
+                                ),
+                              );
+                            },
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// --- CHAT ROOM ---
+class ModernChatRoom extends StatefulWidget {
+  final String threadId;
+
+  const ModernChatRoom({super.key, required this.threadId});
+
+  @override
+  State<ModernChatRoom> createState() => _ModernChatRoomState();
+}
+
+class _ModernChatRoomState extends State<ModernChatRoom> {
+  final TextEditingController _msgController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  final AudioRecorder _audioRecorder = AudioRecorder();
+
+  bool _isRecordingVoice = false;
+  String? _recordingPath;
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  bool _isImageFile(String? fileName) {
+    if (fileName == null) return false;
+    final lower = fileName.toLowerCase();
+
+    return lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg") ||
+        lower.endsWith(".png") ||
+        lower.endsWith(".gif") ||
+        lower.endsWith(".webp") ||
+        lower.endsWith(".bmp");
+  }
+
+  bool _isVideoFile(String? fileName) {
+    if (fileName == null) return false;
+    final lower = fileName.toLowerCase();
+
+    return lower.endsWith(".mp4") ||
+        lower.endsWith(".mov") ||
+        lower.endsWith(".mkv") ||
+        lower.endsWith(".webm") ||
+        lower.endsWith(".avi");
+  }
+
+  bool _isAudioFile(String? fileName) {
+    if (fileName == null) return false;
+    final lower = fileName.toLowerCase();
+
+    return lower.endsWith(".m4a") ||
+        lower.endsWith(".aac") ||
+        lower.endsWith(".mp3") ||
+        lower.endsWith(".wav") ||
+        lower.endsWith(".ogg") ||
+        lower.endsWith(".opus");
+  }
+
+  Future<void> _openFile(ChatMessage message) async {
+    final path = message.filePath;
+
+    if (path == null || path.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Nu am cale pentru fișier.")),
+      );
+      return;
+    }
+
+    final file = File(path);
+
+    if (!await file.exists()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Fișierul nu mai există pe dispozitiv.")),
+      );
+      return;
+    }
+
+    await OpenFilex.open(path);
+  }
+
+  Future<void> _downloadFile(ChatMessage message) async {
+    final sourcePath = message.filePath;
+    final fileName = message.fileName ?? "meshup_file";
+
+    if (sourcePath == null || sourcePath.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Nu am cale pentru fișier.")),
+      );
+      return;
+    }
+
+    final sourceFile = File(sourcePath);
+
+    if (!await sourceFile.exists()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Fișierul nu mai există pe dispozitiv.")),
+      );
+      return;
+    }
+
+    try {
+      final bytes = await sourceFile.readAsBytes();
+
+      final savedPath = await FilePicker.platform.saveFile(
+        dialogTitle: "Salvează fișierul",
+        fileName: fileName,
+        bytes: bytes,
+      );
+
+      if (savedPath == null) return;
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Fișier salvat: $fileName")));
+    } catch (e) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Eroare la salvare: $e")));
+    }
+  }
+
+  Widget _buildFileBubble(ChatMessage message) {
+    final fileName = message.fileName ?? "Fișier";
+    final filePath = message.filePath;
+    final fileExists = filePath != null && File(filePath).existsSync();
+
+    final imagePreview = fileExists && _isImageFile(fileName);
+    final videoPreview = _isVideoFile(fileName);
+    final audioPreview = message.isVoice || _isAudioFile(fileName);
+
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 280),
+      padding: const EdgeInsets.all(10),
+      margin: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: message.isMine
+            ? Theme.of(context).colorScheme.primary
+            : Theme.of(context).cardColor,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (imagePreview)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: Image.file(
+                File(filePath),
+                height: 180,
+                width: 260,
+                fit: BoxFit.cover,
+              ),
+            )
+          else
+            Container(
+              height: 120,
+              width: 260,
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(
+                audioPreview
+                    ? Icons.mic
+                    : videoPreview
+                    ? Icons.videocam
+                    : Icons.insert_drive_file,
+                size: 46,
+                color: message.isMine ? Colors.white : null,
+              ),
+            ),
+          const SizedBox(height: 8),
+          Text(
+            message.isVoice ? "Mesaj vocal" : fileName,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: message.isMine ? Colors.white : null,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: fileExists ? () => _openFile(message) : null,
+                  icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                  label: Text(
+                    message.isVoice || audioPreview ? "Play" : "Open",
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: fileExists ? () => _downloadFile(message) : null,
+                  icon: const Icon(Icons.file_download_outlined, size: 18),
+                  label: const Text("Save"),
+                ),
+              ),
+            ],
+          ),
+          if (!fileExists)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                "Fișier indisponibil local",
+                style: TextStyle(
+                  fontSize: 12,
+                  color: message.isMine ? Colors.white70 : Colors.red,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _sendFile(ChatThread thread) async {
+    final nodeId = thread.deviceId;
+    if (nodeId == null) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+
+    if (!nearby.isDeviceConnected(nodeId)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Conectează-te la device înainte să trimiți fișiere."),
+        ),
+      );
+      return;
+    }
+
+    final sentPath = await nearby.sendFileToDevice(nodeId);
+    if (sentPath == null) {
+      if (nearby.status.isNotEmpty) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(nearby.status)));
+      }
+      return;
+    }
+
+    final fileName = sentPath.split(Platform.pathSeparator).last;
+
+    settings.addMessageToThreadId(
+      thread.id,
+      ChatMessage(
+        id: const Uuid().v4(),
+        text: "📎 Fișier trimis: $fileName",
+        isMine: true,
+        timestamp: DateTime.now(),
+        type: "file",
+        fileName: fileName,
+        filePath: sentPath,
+      ),
+    );
+
+    _scrollToBottom();
+  }
+
+  Future<void> _toggleVoiceRecording(ChatThread thread) async {
+    if (_isRecordingVoice) {
+      await _stopAndSendVoice(thread);
+    } else {
+      await _startVoiceRecording(thread);
+    }
+  }
+
+  Future<void> _startVoiceRecording(ChatThread thread) async {
+    final nodeId = thread.deviceId;
+    if (nodeId == null) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+    if (!nearby.isDeviceConnected(nodeId)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Conectează-te la device înainte să trimiți mesaje vocale.",
+          ),
+        ),
+      );
+      return;
+    }
+
+    final micOk = await requestMicrophonePermission();
+    if (!micOk) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Permisiunea pentru microfon este necesară pentru mesaje vocale.",
+          ),
+        ),
+      );
+      return;
+    }
+
+    final hasRecorderPermission = await _audioRecorder.hasPermission();
+    if (!hasRecorderPermission) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Aplicația nu are acces la microfon.")),
+      );
+      return;
+    }
+
+    final dir = await getTemporaryDirectory();
+    final fileName = "voice_${DateTime.now().millisecondsSinceEpoch}.m4a";
+    final path = "${dir.path}/$fileName";
+
+    await _audioRecorder.start(
+      const RecordConfig(encoder: AudioEncoder.aacLc),
+      path: path,
+    );
+
+    setState(() {
+      _isRecordingVoice = true;
+      _recordingPath = path;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Înregistrare pornită. Apasă din nou pe microfon ca să trimiți.",
+        ),
+      ),
+    );
+  }
+
+  Future<void> _stopAndSendVoice(ChatThread thread) async {
+    final nodeId = thread.deviceId;
+    if (nodeId == null) return;
+
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+
+    final stoppedPath = await _audioRecorder.stop();
+
+    setState(() {
+      _isRecordingVoice = false;
+      _recordingPath = null;
+    });
+
+    final path = stoppedPath;
+    if (path == null || path.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Înregistrarea nu a fost salvată.")),
+      );
+      return;
+    }
+
+    final file = File(path);
+    if (!await file.exists()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Fișierul audio nu există local.")),
+      );
+      return;
+    }
+
+    final fileName = path.split(Platform.pathSeparator).last;
+    final sentPath = await nearby.sendPathPayloadToDevice(
+      nodeId: nodeId,
+      path: path,
+      fileName: fileName,
+      size: await file.length(),
+      kind: "voice",
+    );
+
+    if (sentPath == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(nearby.status)));
+      return;
+    }
+
+    settings.addMessageToThreadId(
+      thread.id,
+      ChatMessage(
+        id: const Uuid().v4(),
+        text: "🎤 Mesaj vocal",
+        isMine: true,
+        timestamp: DateTime.now(),
+        type: "voice",
+        fileName: fileName,
+        filePath: sentPath,
+      ),
+    );
+
+    _scrollToBottom();
+  }
+
+  Future<void> _send(ChatThread thread) async {
+    if (_msgController.text.trim().isEmpty) return;
+
+    final nodeId = thread.deviceId;
+    final text = _msgController.text.trim();
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+    settings.addMessageToThreadId(
+      thread.id,
+      ChatMessage(
+        id: const Uuid().v4(),
+        text: text,
+        isMine: true,
+        timestamp: DateTime.now(),
+      ),
+    );
+
+    _msgController.clear();
+    _scrollToBottom();
+
+    if (nodeId != null) {
+      final sent = await nearby.sendTextToDevice(nodeId, text);
+      if (!sent && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(nearby.status)));
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Chat local. Pentru trimitere reală conectează-te din Scan.",
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _audioRecorder.dispose();
+    _msgController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = Provider.of<SettingsProvider>(context);
+    final nearby = Provider.of<NearbyProvider>(context);
+    final thread = settings.threadById(widget.threadId);
+
+    if (thread == null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text("Chat")),
+        body: const Center(child: Text("Conversația nu mai există.")),
+      );
+    }
+
+    final nodeId = thread.deviceId;
+    final online = nearby.isDeviceOnline(nodeId);
+    final connected = nearby.isDeviceConnected(nodeId);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(thread.title),
+            Text(
+              connected
+                  ? "Connected Nearby"
+                  : online
+                  ? "Online, neconectat"
+                  : "Offline",
+              style: TextStyle(
+                fontSize: 12,
+                color: connected
+                    ? Colors.green
+                    : online
+                    ? Colors.orange
+                    : null,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          if (nodeId != null)
+            TextButton.icon(
+              onPressed: connected
+                  ? () => nearby.disconnectDevice(nodeId)
+                  : online
+                  ? () => nearby.connectToDevice(nodeId)
+                  : null,
+              icon: Icon(connected ? Icons.link_off : Icons.link),
+              label: Text(connected ? "Disconnect" : "Connect"),
+            ),
+        ],
+      ),
       body: Column(
         children: [
-          if (_isScanning) const LinearProgressIndicator(),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            color: connected
+                ? Colors.green.withOpacity(0.15)
+                : online
+                ? Colors.orange.withOpacity(0.15)
+                : Colors.grey.withOpacity(0.15),
+            child: Text(
+              connected
+                  ? "Nearby ready: mesajele și fișierele se trimit către device-ul conectat."
+                  : online
+                  ? "Device online. Apasă Connect ca să reiei conversația."
+                  : "Device offline sau nedetectat momentan.",
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
           Expanded(
-            child: list.isEmpty
-                ? const Center(child: Text('Niciun device găsit încă'))
-                : ListView.separated(
-                    itemCount: list.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (_, index) {
-                      final result = list[index];
-                      final name = _displayName(result);
-                      return ListTile(
-                        leading: const Icon(Icons.bluetooth),
-                        title: Text(name),
-                        subtitle: Text(result.device.remoteId.str),
-                        trailing: Text('RSSI ${result.rssi}'),
-                        onTap: () {
-                          final thread = ChatThread(
-                            id: _uuid.v4(),
-                            title: name,
-                            deviceId: result.device.remoteId.str,
-                            persistent: false,
-                            messages: [],
-                          );
-                          Navigator.pop(context, thread);
-                        },
+            child: thread.messages.isEmpty
+                ? const Center(child: Text("Nu există mesaje încă."))
+                : ListView.builder(
+                    controller: _scrollController,
+                    itemCount: thread.messages.length,
+                    itemBuilder: (context, i) {
+                      final message = thread.messages[i];
+
+                      return Align(
+                        alignment: message.isMine
+                            ? Alignment.centerRight
+                            : Alignment.centerLeft,
+                        child: (message.isFile || message.isVoice)
+                            ? _buildFileBubble(message)
+                            : Container(
+                                padding: const EdgeInsets.all(12),
+                                margin: const EdgeInsets.all(6),
+                                decoration: BoxDecoration(
+                                  color: message.isMine
+                                      ? Theme.of(context).colorScheme.primary
+                                      : Theme.of(context).cardColor,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Text(
+                                  message.text,
+                                  style: TextStyle(
+                                    color: message.isMine ? Colors.white : null,
+                                  ),
+                                ),
+                              ),
                       );
                     },
                   ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _msgController,
+                      decoration: const InputDecoration(
+                        hintText: "Mesaj...",
+                        border: OutlineInputBorder(),
+                      ),
+                      onSubmitted: (_) => _send(thread),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    onPressed: connected ? () => _sendFile(thread) : null,
+                    icon: const Icon(Icons.attach_file),
+                  ),
+                  IconButton.filledTonal(
+                    onPressed: connected
+                        ? () => _toggleVoiceRecording(thread)
+                        : null,
+                    icon: Icon(_isRecordingVoice ? Icons.stop : Icons.mic),
+                  ),
+                  IconButton.filled(
+                    onPressed: () => _send(thread),
+                    icon: const Icon(Icons.send),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),
@@ -463,246 +2072,155 @@ class _DeviceScannerPageState extends State<DeviceScannerPage> {
   }
 }
 
-class ChatRoomPage extends StatefulWidget {
-  final ChatThread initialThread;
-
-  const ChatRoomPage({super.key, required this.initialThread});
+// --- SETTINGS ---
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
 
   @override
-  State<ChatRoomPage> createState() => _ChatRoomPageState();
+  State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _ChatRoomPageState extends State<ChatRoomPage> {
-  late ChatThread _thread;
-  final _controller = TextEditingController();
-  final _uuid = const Uuid();
-  final _ble = BleChatService();
-
-  bool _connecting = false;
-  bool _connected = false;
-  StreamSubscription<String>? _incomingSub;
-  StreamSubscription<bool>? _stateSub;
+class _SettingsPageState extends State<SettingsPage> {
+  late final TextEditingController _aliasController;
 
   @override
   void initState() {
     super.initState();
-    _thread = ChatThread(
-      id: widget.initialThread.id,
-      title: widget.initialThread.title,
-      deviceId: widget.initialThread.deviceId,
-      persistent: widget.initialThread.persistent,
-      messages: [...widget.initialThread.messages],
-    );
 
-    _incomingSub = _ble.incomingMessages.listen((message) {
-      setState(() {
-        _thread.messages.add(
-          ChatMessage(
-            id: _uuid.v4(),
-            text: message,
-            isMine: false,
-            timestamp: DateTime.now(),
-          ),
-        );
-      });
-    });
-
-    _stateSub = _ble.connectionState.listen((state) {
-      if (mounted) {
-        setState(() {
-          _connected = state;
-        });
-      }
-    });
-  }
-
-  Future<void> _connect() async {
-    if (_thread.deviceId == null) return;
-
-    setState(() => _connecting = true);
-    try {
-      final bonded = FlutterBluePlus.connectedDevices;
-      BluetoothDevice? device;
-
-      for (final d in bonded) {
-        if (d.remoteId.str == _thread.deviceId) {
-          device = d;
-          break;
-        }
-      }
-
-      device ??= BluetoothDevice.fromId(_thread.deviceId!);
-
-      await _ble.connectToDevice(device);
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Conectat')));
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Eroare conectare: $e')));
-      }
-    } finally {
-      if (mounted) setState(() => _connecting = false);
-    }
-  }
-
-  Future<void> _disconnect() async {
-    await _ble.disconnect();
-  }
-
-  Future<void> _send() async {
-    final text = _controller.text.trim();
-    if (text.isEmpty) return;
-
-    setState(() {
-      _thread.messages.add(
-        ChatMessage(
-          id: _uuid.v4(),
-          text: text,
-          isMine: true,
-          timestamp: DateTime.now(),
-        ),
-      );
-    });
-
-    _controller.clear();
-
-    try {
-      await _ble.sendMessage(text);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Trimiterea a eșuat: $e')));
-      }
-    }
-  }
-
-  Future<bool> _onWillPop() async {
-    Navigator.pop(context, _thread);
-    return false;
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+    _aliasController = TextEditingController(text: settings.alias);
   }
 
   @override
   void dispose() {
-    _incomingSub?.cancel();
-    _stateSub?.cancel();
-    _ble.dispose();
-    _controller.dispose();
+    _aliasController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      onPopInvoked: (_) async => _onWillPop(),
-      child: Scaffold(
-        appBar: AppBar(
-          title: Text(_thread.title),
-          actions: [
-            Row(
-              children: [
-                const Text('Salvează'),
-                Switch(
-                  value: _thread.persistent,
-                  onChanged: (v) => setState(() => _thread.persistent = v),
-                ),
-              ],
+    final settings = Provider.of<SettingsProvider>(context);
+    final nearby = Provider.of<NearbyProvider>(context, listen: false);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          ListTile(
+            leading: CircleAvatar(
+              backgroundColor: settings.accentColor,
+              child: const Text('ME'),
             ),
-            if (_thread.deviceId != null)
-              IconButton(
-                onPressed: _connected
-                    ? _disconnect
-                    : (_connecting ? null : _connect),
-                icon: Icon(_connected ? Icons.link_off : Icons.link),
-              ),
-          ],
-        ),
-        body: Column(
-          children: [
-            Material(
-              color: Colors.black12,
-              child: ListTile(
-                leading: Icon(
-                  _connected
-                      ? Icons.bluetooth_connected
-                      : Icons.bluetooth_disabled,
-                ),
-                title: Text(_thread.deviceId ?? 'Chat fără device BLE'),
-                subtitle: Text(
-                  _connected
-                      ? 'Conectat'
-                      : (_connecting ? 'Se conectează...' : 'Neconectat'),
-                ),
-              ),
+            title: const Text('My Device'),
+            subtitle: Text(
+              "${settings.alias} • ID permanent: ${nearby.localNodeId}",
             ),
-            Expanded(
-              child: ListView.builder(
-                padding: const EdgeInsets.all(12),
-                itemCount: _thread.messages.length,
-                itemBuilder: (_, index) {
-                  final m = _thread.messages[index];
-                  return Align(
-                    alignment: m.isMine
-                        ? Alignment.centerRight
-                        : Alignment.centerLeft,
-                    child: Container(
-                      margin: const EdgeInsets.symmetric(vertical: 4),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                      constraints: const BoxConstraints(maxWidth: 280),
-                      decoration: BoxDecoration(
-                        color: m.isMine
-                            ? Colors.blue.shade100
-                            : Colors.grey.shade300,
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(m.text),
-                          const SizedBox(height: 4),
-                          Text(
-                            '${m.timestamp.hour.toString().padLeft(2, '0')}:${m.timestamp.minute.toString().padLeft(2, '0')}',
-                            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    "Alias Nearby",
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _aliasController,
+                    decoration: const InputDecoration(
+                      labelText: "Numele meu",
+                      hintText: "Ex: Alex, Dva, Telefonul meu",
+                      border: OutlineInputBorder(),
+                    ),
+                    onSubmitted: (value) async {
+                      settings.updateAlias(value);
+                      await nearby.restartNearby();
+
+                      if (!context.mounted) return;
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text("Alias salvat și Nearby repornit."),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: () async {
+                        settings.updateAlias(_aliasController.text);
+                        await nearby.restartNearby();
+
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text("Alias salvat și Nearby repornit."),
                           ),
-                        ],
-                      ),
+                        );
+                      },
+                      child: const Text("Salvează alias"),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    "Numele rămâne salvat. ID-ul permanent nu se schimbă la restart, deci conversațiile pot fi reluate când device-ul reapare online.",
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          SwitchListTile(
+            title: const Text("Save History"),
+            value: settings.saveHistory,
+            onChanged: (v) => settings.toggleSaveHistory(v),
+          ),
+          SwitchListTile(
+            title: const Text("Notifications"),
+            subtitle: const Text(
+              "Primești notificări doar când aplicația nu este deschisă.",
+            ),
+            value: settings.notificationsEnabled,
+            onChanged: (v) => settings.toggleNotifications(v),
+          ),
+          ListTile(
+            leading: const Icon(Icons.delete, color: Colors.red),
+            title: const Text("Clear Chats"),
+            onTap: () => settings.clearChats(),
+          ),
+          SwitchListTile(
+            title: const Text("Dark Mode"),
+            value: settings.isDarkMode,
+            onChanged: (v) => settings.toggleTheme(v),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children:
+                [
+                  Colors.blue,
+                  Colors.purple,
+                  Colors.green,
+                  Colors.orange,
+                  Colors.pink,
+                ].map((color) {
+                  return GestureDetector(
+                    onTap: () => settings.updateAccent(color),
+                    child: CircleAvatar(
+                      backgroundColor: color,
+                      radius: 18,
+                      child: settings.accentColor.value == color.value
+                          ? const Icon(Icons.check, color: Colors.white)
+                          : null,
                     ),
                   );
-                },
-              ),
-            ),
-            SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _controller,
-                        decoration: const InputDecoration(
-                          hintText: 'Mesaj',
-                          border: OutlineInputBorder(),
-                        ),
-                        onSubmitted: (_) => _send(),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(onPressed: _send, icon: const Icon(Icons.send)),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
+                }).toList(),
+          ),
+        ],
       ),
     );
   }

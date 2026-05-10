@@ -34,9 +34,19 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  flutter_blue_plus: ^1.35.5
+  # flutter_blue_plus: ^1.35.5
+  # flutter_ble_peripheral: ^2.1.0
   shared_preferences: ^2.5.3
   uuid: ^4.5.1
+  provider: ^6.1.5+1
+  permission_handler: ^11.3.1
+  nearby_connections: ^4.3.0
+  # device_info_plus: ^10.1.2
+  file_picker: ^8.1.7
+  path_provider: ^2.1.5
+  open_filex: ^4.6.0
+  record: ^6.2.0
+  flutter_local_notifications: ^19.5.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -47,7 +57,7 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
-
+  flutter_launcher_icons: ^0.14.4
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 
@@ -58,6 +68,13 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/meshchat_app_icon_transparent.png"
+  adaptive_icon_background: "#0052D4"
+  adaptive_icon_foreground: "assets/icon/meshchat_app_icon_transparent.png"
 
   # To add assets to your application, add an assets section, like this:
   # assets:
