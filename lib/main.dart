@@ -101,6 +101,112 @@ class AppNotifications {
   }
 }
 
+void showTopInAppNotification(
+  BuildContext context, {
+  required String message,
+  required Color accentColor,
+  IconData icon = Icons.notifications_none,
+  Duration duration = const Duration(seconds: 3),
+}) {
+  final overlay = Overlay.maybeOf(context);
+  if (overlay == null) return;
+
+  late OverlayEntry entry;
+  var removed = false;
+
+  void remove() {
+    if (removed) return;
+    removed = true;
+    entry.remove();
+  }
+
+  entry = OverlayEntry(
+    builder: (context) {
+      final theme = Theme.of(context);
+      final isDark = theme.brightness == Brightness.dark;
+      final backgroundColor = isDark
+          ? Color.alphaBlend(
+              accentColor.withOpacity(0.32),
+              const Color(0xFF171A21),
+            )
+          : Color.alphaBlend(accentColor.withOpacity(0.14), Colors.white);
+      final borderColor = accentColor.withOpacity(isDark ? 0.55 : 0.35);
+      final iconBackgroundColor = accentColor.withOpacity(isDark ? 0.28 : 0.16);
+      final textColor = isDark ? Colors.white : const Color(0xFF111827);
+
+      return Positioned(
+        top: 0,
+        left: 0,
+        right: 0,
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: remove,
+                borderRadius: BorderRadius.circular(18),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: backgroundColor,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: borderColor),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(isDark ? 0.35 : 0.16),
+                        blurRadius: 18,
+                        offset: const Offset(0, 8),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: iconBackgroundColor,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(icon, color: accentColor, size: 20),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          message,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: textColor,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Icon(
+                        Icons.close,
+                        size: 18,
+                        color: textColor.withOpacity(0.75),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+
+  overlay.insert(entry);
+  Future.delayed(duration, remove);
+}
+
 // -----------------------------------------------------------------------------
 // PERMISSIONS
 // -----------------------------------------------------------------------------
@@ -354,6 +460,7 @@ class SettingsProvider extends ChangeNotifier {
   bool _isDarkMode = true;
   bool _saveHistory = true;
   bool _notificationsEnabled = true;
+  bool _inAppNotificationsEnabled = true;
   Color _accentColor = const Color(0xFF0052D4);
   String _alias = 'MeshChat';
   List<ChatThread> _threads = [];
@@ -362,6 +469,8 @@ class SettingsProvider extends ChangeNotifier {
     _isDarkMode = _prefs.getBool('dark_mode') ?? true;
     _saveHistory = _prefs.getBool('save_history') ?? true;
     _notificationsEnabled = _prefs.getBool('notifications_enabled') ?? true;
+    _inAppNotificationsEnabled =
+        _prefs.getBool('in_app_notifications_enabled') ?? true;
     _accentColor = Color(_prefs.getInt('accent_color') ?? 0xFF0052D4);
     _alias = _prefs.getString('alias') ?? 'MeshChat';
     _loadThreads();
@@ -370,6 +479,7 @@ class SettingsProvider extends ChangeNotifier {
   bool get isDarkMode => _isDarkMode;
   bool get saveHistory => _saveHistory;
   bool get notificationsEnabled => _notificationsEnabled;
+  bool get inAppNotificationsEnabled => _inAppNotificationsEnabled;
   Color get accentColor => _accentColor;
   String get alias => _alias;
   List<ChatThread> get threads => _threads;
@@ -403,6 +513,12 @@ class SettingsProvider extends ChangeNotifier {
 
     _notificationsEnabled = val;
     _prefs.setBool('notifications_enabled', val);
+    notifyListeners();
+  }
+
+  void toggleInAppNotifications(bool val) {
+    _inAppNotificationsEnabled = val;
+    _prefs.setBool('in_app_notifications_enabled', val);
     notifyListeners();
   }
 
@@ -1042,10 +1158,12 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
           _pendingFileNames[payloadId] = fileName;
           _pendingFileKinds[payloadId] = kind;
           if (groupId != null) _pendingFileGroupIds[payloadId] = groupId;
-          if (senderNodeId != null)
+          if (senderNodeId != null) {
             _pendingFileSenderNodeIds[payloadId] = senderNodeId;
-          if (senderName != null)
+          }
+          if (senderName != null) {
             _pendingFileSenderNames[payloadId] = senderName;
+          }
 
           _saveReceivedFileIfReady(
             payloadId: payloadId,
@@ -1554,16 +1672,21 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       return;
     }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          incoming.type == NearbyIncomingType.voice
-              ? 'New voice message from ${incoming.senderName ?? incoming.displayName}'
-              : incoming.type == NearbyIncomingType.file
-              ? 'File from ${incoming.senderName ?? incoming.displayName}: ${incoming.fileName ?? 'file'}'
-              : 'New message from ${incoming.senderName ?? incoming.displayName}',
-        ),
-      ),
+    if (!settings.inAppNotificationsEnabled) return;
+
+    showTopInAppNotification(
+      context,
+      accentColor: settings.accentColor,
+      icon: incoming.type == NearbyIncomingType.voice
+          ? Icons.mic
+          : incoming.type == NearbyIncomingType.file
+          ? Icons.attach_file
+          : Icons.chat_bubble_outline,
+      message: incoming.type == NearbyIncomingType.voice
+          ? 'New voice message from ${incoming.senderName ?? incoming.displayName}'
+          : incoming.type == NearbyIncomingType.file
+          ? 'File from ${incoming.senderName ?? incoming.displayName}: ${incoming.fileName ?? 'file'}'
+          : 'New message from ${incoming.senderName ?? incoming.displayName}',
     );
   }
 
@@ -2886,12 +3009,20 @@ class _SettingsPageState extends State<SettingsPage> {
             onChanged: (v) => settings.toggleSaveHistory(v),
           ),
           SwitchListTile(
-            title: const Text('Notifications'),
+            title: const Text('System Notifications'),
             subtitle: const Text(
-              'You will only receive notifications when the app is not open.',
+              'You will only receive phone notifications when the app is not open.',
             ),
             value: settings.notificationsEnabled,
             onChanged: (v) => settings.toggleNotifications(v),
+          ),
+          SwitchListTile(
+            title: const Text('In-app Notifications'),
+            subtitle: const Text(
+              'Show a colored banner at the top while the app is open.',
+            ),
+            value: settings.inAppNotificationsEnabled,
+            onChanged: (v) => settings.toggleInAppNotifications(v),
           ),
           ListTile(
             leading: const Icon(Icons.delete, color: Colors.red),
