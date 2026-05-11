@@ -1,3 +1,9 @@
+// Stable rebuild note:
+// This version intentionally keeps Nearby connections peer-to-peer only.
+// Groups are only a routing layer over already connected P2P endpoints.
+// To create or add members to a group, devices must already be connected.
+// This avoids the unstable special group-handshake logic.
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -15,9 +21,12 @@ import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
-const String kNearbyServiceId = "com.meshup.chat";
-const String kEndpointSeparator = "::";
-const String kGroupInviteSeparator = "::GROUPINVITE::";
+const String kNearbyServiceId = 'com.meshup.chat';
+const String kEndpointSeparator = '::';
+
+const String kPayloadGroupInvite = '__GROUP_INVITE__:';
+const String kPayloadGroupMessage = '__GROUP_MESSAGE__:';
+const String kPayloadFile = '__FILE__:';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -35,7 +44,9 @@ void main() async {
   );
 }
 
-// --- NOTIFICĂRI LOCALE ---
+// -----------------------------------------------------------------------------
+// NOTIFICATIONS
+// -----------------------------------------------------------------------------
 class AppNotifications {
   static final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -51,7 +62,6 @@ class AppNotifications {
   static Future<void> init() async {
     const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     const initSettings = InitializationSettings(android: androidInit);
-
     await _plugin.initialize(initSettings);
 
     final androidPlugin = _plugin
@@ -63,7 +73,6 @@ class AppNotifications {
 
   static Future<bool> requestPermission() async {
     if (!Platform.isAndroid) return true;
-
     final status = await Permission.notification.request();
     return status.isGranted;
   }
@@ -92,7 +101,9 @@ class AppNotifications {
   }
 }
 
-// --- PERMISIUNI ---
+// -----------------------------------------------------------------------------
+// PERMISSIONS
+// -----------------------------------------------------------------------------
 Future<bool> requestNearbyPermissions() async {
   if (!Platform.isAndroid) return true;
 
@@ -112,24 +123,25 @@ Future<bool> requestNearbyPermissions() async {
   final nearbyWifiOk =
       statuses[Permission.nearbyWifiDevices]?.isGranted ?? true;
 
-  debugPrint("Nearby permissions:");
-  debugPrint("LOCATION: $locationOk");
-  debugPrint("BT SCAN: $scanOk");
-  debugPrint("BT ADVERTISE: $advertiseOk");
-  debugPrint("BT CONNECT: $connectOk");
-  debugPrint("NEARBY WIFI: $nearbyWifiOk");
+  debugPrint('Nearby permissions:');
+  debugPrint('LOCATION: $locationOk');
+  debugPrint('BT SCAN: $scanOk');
+  debugPrint('BT ADVERTISE: $advertiseOk');
+  debugPrint('BT CONNECT: $connectOk');
+  debugPrint('NEARBY WIFI: $nearbyWifiOk');
 
   return locationOk && scanOk && advertiseOk && connectOk && nearbyWifiOk;
 }
 
 Future<bool> requestMicrophonePermission() async {
   if (!Platform.isAndroid && !Platform.isIOS) return true;
-
   final status = await Permission.microphone.request();
   return status.isGranted;
 }
 
-// --- MODELE DE DATE ---
+// -----------------------------------------------------------------------------
+// MODELS
+// -----------------------------------------------------------------------------
 class ChatMessage {
   final String id;
   final String text;
@@ -146,15 +158,15 @@ class ChatMessage {
     required this.text,
     required this.isMine,
     required this.timestamp,
-    this.type = "text",
+    this.type = 'text',
     this.fileName,
     this.filePath,
     this.senderNodeId,
     this.senderName,
   });
 
-  bool get isFile => type == "file";
-  bool get isVoice => type == "voice";
+  bool get isFile => type == 'file';
+  bool get isVoice => type == 'voice';
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -173,7 +185,7 @@ class ChatMessage {
     text: json['text'],
     isMine: json['isMine'],
     timestamp: DateTime.parse(json['timestamp']),
-    type: json['type'] ?? "text",
+    type: json['type'] ?? 'text',
     fileName: json['fileName'],
     filePath: json['filePath'],
     senderNodeId: json['senderNodeId'],
@@ -185,14 +197,12 @@ class ChatThread {
   final String id;
   String title;
 
-  /// Pentru 1-la-1: ID-ul permanent al celuilalt telefon.
-  /// Pentru grupuri: null.
+  // For direct chats only.
   final String? deviceId;
 
   final bool isGroup;
   final List<String> participantNodeIds;
   final Map<String, String> participantNames;
-
   List<ChatMessage> messages;
 
   ChatThread({
@@ -252,25 +262,46 @@ class NearbyConnectionRequest {
   final String nodeId;
   final String displayName;
 
-  final bool isGroupInvite;
-  final String? groupId;
-  final String? groupTitle;
-  final List<String> participantNodeIds;
-  final Map<String, String> participantNames;
-
   NearbyConnectionRequest({
     required this.endpointId,
     required this.nodeId,
     required this.displayName,
-    this.isGroupInvite = false,
-    this.groupId,
-    this.groupTitle,
-    this.participantNodeIds = const [],
-    this.participantNames = const {},
   });
 }
 
 enum NearbyIncomingType { text, file, voice }
+
+class NearbyIncomingMessage {
+  final String endpointId;
+  final String nodeId;
+  final String displayName;
+  final String text;
+  final NearbyIncomingType type;
+  final String? filePath;
+  final String? fileName;
+  final String? groupId;
+  final String? groupTitle;
+  final List<String>? groupParticipantNodeIds;
+  final Map<String, String>? groupParticipantNames;
+  final String? senderNodeId;
+  final String? senderName;
+
+  NearbyIncomingMessage({
+    required this.endpointId,
+    required this.nodeId,
+    required this.displayName,
+    required this.text,
+    required this.type,
+    this.filePath,
+    this.fileName,
+    this.groupId,
+    this.groupTitle,
+    this.groupParticipantNodeIds,
+    this.groupParticipantNames,
+    this.senderNodeId,
+    this.senderName,
+  });
+}
 
 class NearbyGroupInvite {
   final String endpointId;
@@ -292,32 +323,6 @@ class NearbyGroupInvite {
   });
 }
 
-class NearbyIncomingMessage {
-  final String endpointId;
-  final String nodeId;
-  final String displayName;
-  final String text;
-  final NearbyIncomingType type;
-  final String? filePath;
-  final String? fileName;
-  final String? groupId;
-  final String? senderNodeId;
-  final String? senderName;
-
-  NearbyIncomingMessage({
-    required this.endpointId,
-    required this.nodeId,
-    required this.displayName,
-    required this.text,
-    required this.type,
-    this.filePath,
-    this.fileName,
-    this.groupId,
-    this.senderNodeId,
-    this.senderName,
-  });
-}
-
 class ParsedEndpointName {
   final String displayName;
   final String nodeId;
@@ -326,9 +331,6 @@ class ParsedEndpointName {
 }
 
 ParsedEndpointName parseEndpointName(String raw) {
-  if (raw.contains(kGroupInviteSeparator)) {
-    raw = raw.split(kGroupInviteSeparator).first;
-  }
   if (!raw.contains(kEndpointSeparator)) {
     return ParsedEndpointName(displayName: raw, nodeId: raw);
   }
@@ -338,12 +340,14 @@ ParsedEndpointName parseEndpointName(String raw) {
   final displayName = parts.join(kEndpointSeparator).trim();
 
   return ParsedEndpointName(
-    displayName: displayName.isEmpty ? "MeshChat" : displayName,
+    displayName: displayName.isEmpty ? 'MeshChat' : displayName,
     nodeId: nodeId,
   );
 }
 
-// --- PROVIDER SETĂRI / ISTORIC ---
+// -----------------------------------------------------------------------------
+// SETTINGS PROVIDER
+// -----------------------------------------------------------------------------
 class SettingsProvider extends ChangeNotifier {
   final SharedPreferences _prefs;
 
@@ -351,7 +355,7 @@ class SettingsProvider extends ChangeNotifier {
   bool _saveHistory = true;
   bool _notificationsEnabled = true;
   Color _accentColor = const Color(0xFF0052D4);
-  String _alias = "MeshChat";
+  String _alias = 'MeshChat';
   List<ChatThread> _threads = [];
 
   SettingsProvider(this._prefs) {
@@ -359,7 +363,7 @@ class SettingsProvider extends ChangeNotifier {
     _saveHistory = _prefs.getBool('save_history') ?? true;
     _notificationsEnabled = _prefs.getBool('notifications_enabled') ?? true;
     _accentColor = Color(_prefs.getInt('accent_color') ?? 0xFF0052D4);
-    _alias = _prefs.getString('alias') ?? "MeshChat";
+    _alias = _prefs.getString('alias') ?? 'MeshChat';
     _loadThreads();
   }
 
@@ -410,15 +414,14 @@ class SettingsProvider extends ChangeNotifier {
 
   void _loadThreads() {
     final raw = _prefs.getString('chat_threads');
+    if (raw == null) return;
 
-    if (raw != null) {
-      try {
-        final List decoded = jsonDecode(raw);
-        _threads = decoded.map((e) => ChatThread.fromJson(e)).toList();
-      } catch (e) {
-        debugPrint("Eroare load threads: $e");
-        _threads = [];
-      }
+    try {
+      final List decoded = jsonDecode(raw);
+      _threads = decoded.map((e) => ChatThread.fromJson(e)).toList();
+    } catch (e) {
+      debugPrint('Error loading threads: $e');
+      _threads = [];
     }
   }
 
@@ -452,24 +455,59 @@ class SettingsProvider extends ChangeNotifier {
     required String title,
   }) {
     final existing = threadByDeviceId(deviceId);
-
     if (existing != null) {
-      if (existing.title != title && title.trim().isNotEmpty) {
-        existing.title = title;
-        existing.participantNames[deviceId] = title;
-        _persistThreads();
-        notifyListeners();
+      if (title.trim().isNotEmpty && existing.title != title.trim()) {
+        existing.title = title.trim();
+        existing.participantNames[deviceId] = title.trim();
+        saveThread(existing);
       }
       return existing;
     }
 
     final thread = ChatThread(
       id: const Uuid().v4(),
-      title: title,
+      title: title.trim().isEmpty ? 'Device' : title.trim(),
       deviceId: deviceId,
       isGroup: false,
       participantNodeIds: [deviceId],
-      participantNames: {deviceId: title},
+      participantNames: {
+        deviceId: title.trim().isEmpty ? 'Device' : title.trim(),
+      },
+      messages: [],
+    );
+
+    _threads.insert(0, thread);
+    _persistThreads();
+    notifyListeners();
+    return thread;
+  }
+
+  ChatThread createOrUpdateGroupThread({
+    required String groupId,
+    required String title,
+    required List<String> participantNodeIds,
+    required Map<String, String> participantNames,
+  }) {
+    final existing = threadById(groupId);
+
+    if (existing != null) {
+      for (final id in participantNodeIds) {
+        if (!existing.participantNodeIds.contains(id)) {
+          existing.participantNodeIds.add(id);
+        }
+      }
+      existing.participantNames.addAll(participantNames);
+      if (title.trim().isNotEmpty) existing.title = title.trim();
+      saveThread(existing);
+      return existing;
+    }
+
+    final thread = ChatThread(
+      id: groupId,
+      title: title.trim().isEmpty ? 'MeshChat Group' : title.trim(),
+      isGroup: true,
+      participantNodeIds: participantNodeIds.toSet().toList(),
+      participantNames: participantNames,
       messages: [],
     );
 
@@ -483,25 +521,13 @@ class SettingsProvider extends ChangeNotifier {
     required String title,
     required List<String> participantNodeIds,
     required Map<String, String> participantNames,
-    String? groupId,
   }) {
-    final id = groupId ?? const Uuid().v4();
-    final existing = threadById(id);
-    if (existing != null) return existing;
-
-    final thread = ChatThread(
-      id: id,
-      title: title.trim().isEmpty ? "Meshchat Group" : title.trim(),
-      isGroup: true,
-      participantNodeIds: participantNodeIds.toSet().toList(),
+    return createOrUpdateGroupThread(
+      groupId: const Uuid().v4(),
+      title: title,
+      participantNodeIds: participantNodeIds,
       participantNames: participantNames,
-      messages: [],
     );
-
-    _threads.insert(0, thread);
-    _persistThreads();
-    notifyListeners();
-    return thread;
   }
 
   void saveThread(ChatThread thread) {
@@ -521,7 +547,7 @@ class SettingsProvider extends ChangeNotifier {
     saveThread(thread);
   }
 
-  ChatThread addIncomingMessage({
+  ChatThread addIncomingDirectMessage({
     required String deviceId,
     required String title,
     required ChatMessage message,
@@ -545,13 +571,16 @@ class SettingsProvider extends ChangeNotifier {
   }
 }
 
-// --- NEARBY GLOBAL PROVIDER ---
+// -----------------------------------------------------------------------------
+// NEARBY PROVIDER
+// -----------------------------------------------------------------------------
 class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
   final SharedPreferences _prefs;
   final Strategy _strategy = Strategy.P2P_CLUSTER;
 
   final Map<String, NearbyDevice> _devicesByEndpoint = {};
   final Map<String, String> _connectedEndpointByNodeId = {};
+
   final Map<int, String> _pendingFileNames = {};
   final Map<int, String> _pendingFileUris = {};
   final Map<int, String> _pendingFileKinds = {};
@@ -569,7 +598,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
   bool _isAdvertising = false;
   bool _isDiscovering = false;
   bool _isStarting = false;
-  String _status = "Nearby is not running yet.";
+  String _status = 'Nearby is not running yet.';
 
   late final String _localNodeId;
 
@@ -586,6 +615,14 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   List<NearbyDevice> get discoveredDevices =>
       _devicesByEndpoint.values.toList();
+
+  List<NearbyDevice> get connectedDevices {
+    return _connectedEndpointByNodeId.keys
+        .map(deviceByNodeId)
+        .whereType<NearbyDevice>()
+        .toList();
+  }
+
   Stream<NearbyIncomingMessage> get incomingMessages =>
       _incomingController.stream;
   Stream<NearbyConnectionRequest> get connectionRequests =>
@@ -593,22 +630,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
   Stream<NearbyGroupInvite> get groupInvites => _groupInviteController.stream;
 
   String advertisingName(String alias) =>
-      "$alias$kEndpointSeparator$_localNodeId";
-
-  String groupInviteConnectionName({
-    required String alias,
-    required ChatThread groupThread,
-  }) {
-    final payload = jsonEncode({
-      "groupId": groupThread.id,
-      "groupTitle": groupThread.title,
-      "participantNodeIds": groupThread.participantNodeIds,
-      "participantNames": groupThread.participantNames,
-    });
-
-    final encoded = base64UrlEncode(utf8.encode(payload));
-    return "${advertisingName(alias)}$kGroupInviteSeparator$encoded";
-  }
+      '$alias$kEndpointSeparator$_localNodeId';
 
   bool isDeviceOnline(String? nodeId) {
     if (nodeId == null) return false;
@@ -629,15 +651,21 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     return null;
   }
 
-  NearbyDevice? deviceByEndpointId(String endpointId) {
-    return _devicesByEndpoint[endpointId];
-  }
+  NearbyDevice? deviceByEndpointId(String endpointId) =>
+      _devicesByEndpoint[endpointId];
 
-  List<NearbyDevice> onlineGroupCandidates() => discoveredDevices;
+  int connectedOtherCountForGroup(ChatThread thread) {
+    if (!thread.isGroup) return 0;
+    return thread.participantNodeIds
+        .where((id) => id != _localNodeId)
+        .where(isDeviceConnected)
+        .length;
+  }
 
   int activeCountForThread(ChatThread thread) {
     if (!thread.isGroup) return isDeviceConnected(thread.deviceId) ? 1 : 0;
-    return thread.participantNodeIds.where(isDeviceConnected).length;
+    final self = thread.participantNodeIds.contains(_localNodeId) ? 1 : 0;
+    return self + connectedOtherCountForGroup(thread);
   }
 
   List<String> activeNamesForThread(ChatThread thread) {
@@ -646,15 +674,21 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       return [thread.title];
     }
 
-    return thread.participantNodeIds
-        .where(isDeviceConnected)
-        .map(
-          (id) =>
-              thread.participantNames[id] ??
-              deviceByNodeId(id)?.displayName ??
-              id,
-        )
-        .toList();
+    final names = <String>[];
+
+    if (thread.participantNodeIds.contains(_localNodeId)) {
+      names.add('${_prefs.getString('alias') ?? 'Me'} (me)');
+    }
+
+    for (final id in thread.participantNodeIds) {
+      if (id == _localNodeId) continue;
+      if (!isDeviceConnected(id)) continue;
+      names.add(
+        thread.participantNames[id] ?? deviceByNodeId(id)?.displayName ?? id,
+      );
+    }
+
+    return names;
   }
 
   Future<void> start() async {
@@ -662,9 +696,8 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     _isStarting = true;
 
     final ok = await requestNearbyPermissions();
-
     if (!ok) {
-      _status = "Permissions denied. Enable Location / Nearby devices / Wi-Fi.";
+      _status = 'Permissions denied. Enable Location / Nearby devices / Wi-Fi.';
       _isStarting = false;
       notifyListeners();
       return;
@@ -672,15 +705,12 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     await startAdvertising();
     await startDiscovery();
-
     _isStarting = false;
   }
 
   Future<void> startAdvertising() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final alias = prefs.getString('alias') ?? "MeshChat";
-
+      final alias = _prefs.getString('alias') ?? 'MeshChat';
       final result = await Nearby().startAdvertising(
         advertisingName(alias),
         _strategy,
@@ -692,28 +722,25 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
       _isAdvertising = result;
       _status = result
-          ? "Advertising started as $alias."
-          : "Advertising Nearby failed.";
+          ? 'Advertising started as $alias.'
+          : 'Advertising failed.';
       notifyListeners();
     } catch (e) {
       _isAdvertising = false;
-      _status = "Error advertising: $e";
+      _status = 'Advertising error: $e';
       notifyListeners();
     }
   }
 
   Future<void> startDiscovery() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final alias = prefs.getString('alias') ?? "MeshChat";
-
+      final alias = _prefs.getString('alias') ?? 'MeshChat';
       final result = await Nearby().startDiscovery(
         advertisingName(alias),
         _strategy,
         serviceId: kNearbyServiceId,
         onEndpointFound: (endpointId, endpointName, serviceId) {
           final parsed = parseEndpointName(endpointName);
-
           if (parsed.nodeId == _localNodeId) return;
 
           _devicesByEndpoint[endpointId] = NearbyDevice(
@@ -722,7 +749,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
             displayName: parsed.displayName,
           );
 
-          _status = "Găsit: ${parsed.displayName}";
+          _status = 'Found: ${parsed.displayName}';
           notifyListeners();
         },
         onEndpointLost: (endpointId) {
@@ -735,11 +762,11 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       );
 
       _isDiscovering = result;
-      if (result) _status = "Discovery started. Looking for other devices...";
+      if (result) _status = 'Discovery started.';
       notifyListeners();
     } catch (e) {
       _isDiscovering = false;
-      _status = "Error discovery: $e";
+      _status = 'Discovery error: $e';
       notifyListeners();
     }
   }
@@ -748,34 +775,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     String endpointId,
     ConnectionInfo connectionInfo,
   ) {
-    final rawName = connectionInfo.endpointName;
-    final parsed = parseEndpointName(rawName);
-
-    bool isGroupInvite = false;
-    String? groupId;
-    String? groupTitle;
-    List<String> participantNodeIds = [];
-    Map<String, String> participantNames = {};
-
-    if (rawName.contains(kGroupInviteSeparator)) {
-      try {
-        final encoded = rawName.split(kGroupInviteSeparator).last;
-        final data =
-            jsonDecode(utf8.decode(base64Url.decode(encoded)))
-                as Map<String, dynamic>;
-        isGroupInvite = true;
-        groupId = data["groupId"] as String?;
-        groupTitle = data["groupTitle"] as String?;
-        participantNodeIds = ((data["participantNodeIds"] as List?) ?? const [])
-            .map((e) => e.toString())
-            .toList();
-        participantNames = Map<String, String>.from(
-          data["participantNames"] ?? {},
-        );
-      } catch (e) {
-        debugPrint("Error parsing group invite connection name: $e");
-      }
-    }
+    final parsed = parseEndpointName(connectionInfo.endpointName);
 
     _devicesByEndpoint[endpointId] = NearbyDevice(
       endpointId: endpointId,
@@ -783,9 +783,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       displayName: parsed.displayName,
     );
 
-    _status = isGroupInvite
-        ? "Group invite from ${parsed.displayName}."
-        : "Connection request from ${parsed.displayName}.";
+    _status = 'Connection request from ${parsed.displayName}.';
     notifyListeners();
 
     _connectionRequestController.add(
@@ -793,11 +791,6 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
         endpointId: endpointId,
         nodeId: parsed.nodeId,
         displayName: parsed.displayName,
-        isGroupInvite: isGroupInvite,
-        groupId: groupId,
-        groupTitle: groupTitle,
-        participantNodeIds: participantNodeIds,
-        participantNames: participantNames,
       ),
     );
   }
@@ -808,17 +801,17 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
         endpointId,
         onPayLoadRecieved: _onPayloadReceived,
         onPayloadTransferUpdate: (endpointId, update) {
-          debugPrint("Payload update from $endpointId: ${update.status}");
+          debugPrint('Payload update from $endpointId: ${update.status}');
         },
       );
 
       final device = _devicesByEndpoint[endpointId];
       if (device != null) {
-        _status = "Connection accepted with ${device.displayName}.";
+        _status = 'Connection accepted with ${device.displayName}.';
       }
       notifyListeners();
     } catch (e) {
-      _status = "Error accepting connection: $e";
+      _status = 'Accept connection error: $e';
       notifyListeners();
     }
   }
@@ -826,10 +819,10 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> rejectConnection(String endpointId) async {
     try {
       await Nearby().rejectConnection(endpointId);
-      _status = "Connection rejected.";
+      _status = 'Connection rejected.';
       notifyListeners();
     } catch (e) {
-      _status = "Error rejecting connection: $e";
+      _status = 'Reject connection error: $e';
       notifyListeners();
     }
   }
@@ -842,12 +835,12 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       if (device != null) {
         _connectedEndpointByNodeId[device.nodeId] = endpointId;
       }
-      _status = "Connected to $name.";
+      _status = 'Connected to $name.';
     } else {
       if (device != null) {
         _connectedEndpointByNodeId.remove(device.nodeId);
       }
-      _status = "Connection failed with $name: $status";
+      _status = 'Connection failed with $name: $status';
     }
 
     notifyListeners();
@@ -857,35 +850,34 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     final device = _devicesByEndpoint[endpointId];
     if (device != null) {
       _connectedEndpointByNodeId.remove(device.nodeId);
-      _status = "Disconnected: ${device.displayName}";
+      _status = 'Disconnected: ${device.displayName}';
     } else {
-      _status = "Disconnected: $endpointId";
+      _status = 'Disconnected: $endpointId';
     }
     notifyListeners();
   }
 
   Future<void> connectToDevice(String nodeId) async {
     final device = deviceByNodeId(nodeId);
-
     if (device == null) {
-      _status = "Device not online";
+      _status = 'Device is not online or not discovered.';
       notifyListeners();
       return;
     }
 
     try {
-      _status = "Connection requested with ${device.displayName}...";
+      _status = 'Requesting connection with ${device.displayName}...';
       notifyListeners();
 
       await Nearby().requestConnection(
-        advertisingName(_prefs.getString('alias') ?? "MeshChat"),
+        advertisingName(_prefs.getString('alias') ?? 'MeshChat'),
         device.endpointId,
         onConnectionInitiated: _onConnectionInitiated,
         onConnectionResult: _onConnectionResult,
         onDisconnected: _onDisconnected,
       );
     } catch (e) {
-      _status = "Error connecting: $e";
+      _status = 'Connect error: $e';
       notifyListeners();
     }
   }
@@ -899,7 +891,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     } catch (_) {}
 
     _connectedEndpointByNodeId.remove(nodeId);
-    _status = "Disconnected.";
+    _status = 'Disconnected.';
     notifyListeners();
   }
 
@@ -915,9 +907,10 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     for (final nodeId in thread.participantNodeIds) {
+      if (nodeId == _localNodeId) continue;
       if (!isDeviceConnected(nodeId) && isDeviceOnline(nodeId)) {
         await connectToDevice(nodeId);
-        await Future.delayed(const Duration(milliseconds: 500));
+        await Future.delayed(const Duration(milliseconds: 600));
       }
     }
   }
@@ -932,7 +925,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     _connectedEndpointByNodeId.clear();
     _isAdvertising = false;
     _isDiscovering = false;
-    _status = "Restart Nearby...";
+    _status = 'Restarting Nearby...';
     notifyListeners();
 
     await Future.delayed(const Duration(milliseconds: 500));
@@ -943,110 +936,29 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     required ChatThread groupThread,
     required List<String> targetNodeIds,
   }) async {
-    final alias = _prefs.getString('alias') ?? "MeshChat";
+    final alias = _prefs.getString('alias') ?? 'MeshChat';
 
-    for (final nodeId in targetNodeIds) {
-      if (!isDeviceConnected(nodeId) && isDeviceOnline(nodeId)) {
-        final device = deviceByNodeId(nodeId);
-        if (device != null) {
-          try {
-            await Nearby().requestConnection(
-              groupInviteConnectionName(alias: alias, groupThread: groupThread),
-              device.endpointId,
-              onConnectionInitiated: _onConnectionInitiated,
-              onConnectionResult: _onConnectionResult,
-              onDisconnected: _onDisconnected,
-            );
-          } catch (e) {
-            _status = "Error sending group invite: $e";
-            notifyListeners();
-          }
-        }
-        await Future.delayed(const Duration(seconds: 1));
-      }
+    final payload = {
+      'groupId': groupThread.id,
+      'groupTitle': groupThread.title,
+      'inviterNodeId': _localNodeId,
+      'inviterName': alias,
+      'participantNodeIds': groupThread.participantNodeIds,
+      'participantNames': groupThread.participantNames,
+    };
 
+    for (final nodeId in targetNodeIds.toSet()) {
+      if (nodeId == _localNodeId) continue;
       final endpointId = _connectedEndpointByNodeId[nodeId];
       if (endpointId == null) continue;
-
-      final payload = {
-        "groupId": groupThread.id,
-        "groupTitle": groupThread.title,
-        "inviterNodeId": _localNodeId,
-        "inviterName": alias,
-        "participantNodeIds": groupThread.participantNodeIds,
-        "participantNames": groupThread.participantNames,
-      };
 
       await Nearby().sendBytesPayload(
         endpointId,
         Uint8List.fromList(
-          utf8.encode("__GROUP_INVITE__:${jsonEncode(payload)}"),
+          utf8.encode('$kPayloadGroupInvite${jsonEncode(payload)}'),
         ),
       );
     }
-  }
-
-  Future<void> _saveReceivedFileIfReady({
-    required int payloadId,
-    required String endpointId,
-  }) async {
-    final fileName = _pendingFileNames[payloadId];
-    final fileUri = _pendingFileUris[payloadId];
-
-    if (fileName == null || fileUri == null) return;
-
-    final dir = await getExternalStorageDirectory();
-
-    if (dir == null) {
-      debugPrint("Could not find the save directory.");
-      return;
-    }
-
-    final kind = _pendingFileKinds[payloadId] ?? "file";
-    final groupId = _pendingFileGroupIds[payloadId];
-    final senderNodeId = _pendingFileSenderNodeIds[payloadId];
-    final senderName = _pendingFileSenderNames[payloadId];
-    final safeName = fileName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
-    final destinationPath = "${dir.path}/$safeName";
-
-    final copied = await Nearby().copyFileAndDeleteOriginal(
-      fileUri,
-      destinationPath,
-    );
-
-    final device = _devicesByEndpoint[endpointId];
-    final nodeId = device?.nodeId ?? endpointId;
-    final displayName = device?.displayName ?? endpointId;
-
-    if (copied) {
-      _incomingController.add(
-        NearbyIncomingMessage(
-          endpointId: endpointId,
-          nodeId: senderNodeId ?? nodeId,
-          displayName: senderName ?? displayName,
-          text: kind == "voice"
-              ? "🎤 Mesaj vocal"
-              : "📎 Fișier primit: $safeName",
-          type: kind == "voice"
-              ? NearbyIncomingType.voice
-              : NearbyIncomingType.file,
-          filePath: destinationPath,
-          fileName: safeName,
-          groupId: groupId,
-          senderNodeId: senderNodeId ?? nodeId,
-          senderName: senderName ?? displayName,
-        ),
-      );
-    } else {
-      debugPrint("Failed to copy the received file.");
-    }
-
-    _pendingFileNames.remove(payloadId);
-    _pendingFileUris.remove(payloadId);
-    _pendingFileKinds.remove(payloadId);
-    _pendingFileGroupIds.remove(payloadId);
-    _pendingFileSenderNodeIds.remove(payloadId);
-    _pendingFileSenderNames.remove(payloadId);
   }
 
   void _onPayloadReceived(String endpointId, Payload payload) {
@@ -1060,67 +972,72 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
       final text = utf8.decode(bytes, allowMalformed: true);
 
-      if (text.startsWith("__GROUP_INVITE__:")) {
-        final raw = text.replaceFirst("__GROUP_INVITE__:", "");
-
+      if (text.startsWith(kPayloadGroupInvite)) {
+        final raw = text.replaceFirst(kPayloadGroupInvite, '');
         try {
           final data = jsonDecode(raw) as Map<String, dynamic>;
           _groupInviteController.add(
             NearbyGroupInvite(
               endpointId: endpointId,
-              groupId: data["groupId"] as String,
-              groupTitle: data["groupTitle"] as String,
-              inviterNodeId: data["inviterNodeId"] as String,
-              inviterName: data["inviterName"] as String,
+              groupId: data['groupId'] as String,
+              groupTitle: data['groupTitle'] as String,
+              inviterNodeId: data['inviterNodeId'] as String,
+              inviterName: data['inviterName'] as String,
               participantNodeIds:
-                  ((data["participantNodeIds"] as List?) ?? const [])
+                  ((data['participantNodeIds'] as List?) ?? const [])
                       .map((e) => e.toString())
                       .toList(),
               participantNames: Map<String, String>.from(
-                data["participantNames"] ?? {},
+                data['participantNames'] ?? {},
               ),
             ),
           );
         } catch (e) {
-          debugPrint("Error sending group invite: $e");
+          debugPrint('Group invite parse error: $e');
         }
         return;
       }
 
-      if (text.startsWith("__CHAT__:")) {
-        final raw = text.replaceFirst("__CHAT__:", "");
-
+      if (text.startsWith(kPayloadGroupMessage)) {
+        final raw = text.replaceFirst(kPayloadGroupMessage, '');
         try {
           final data = jsonDecode(raw) as Map<String, dynamic>;
           _incomingController.add(
             NearbyIncomingMessage(
               endpointId: endpointId,
-              nodeId: data["senderNodeId"] as String? ?? nodeId,
-              displayName: data["senderName"] as String? ?? displayName,
-              text: data["text"] as String? ?? "",
+              nodeId: data['senderNodeId'] as String? ?? nodeId,
+              displayName: data['senderName'] as String? ?? displayName,
+              text: data['text'] as String? ?? '',
               type: NearbyIncomingType.text,
-              groupId: data["groupId"] as String?,
-              senderNodeId: data["senderNodeId"] as String? ?? nodeId,
-              senderName: data["senderName"] as String? ?? displayName,
+              groupId: data['groupId'] as String?,
+              groupTitle: data['groupTitle'] as String?,
+              groupParticipantNodeIds:
+                  ((data['participantNodeIds'] as List?) ?? const [])
+                      .map((e) => e.toString())
+                      .toList(),
+              groupParticipantNames: Map<String, String>.from(
+                data['participantNames'] ?? {},
+              ),
+              senderNodeId: data['senderNodeId'] as String? ?? nodeId,
+              senderName: data['senderName'] as String? ?? displayName,
             ),
           );
         } catch (e) {
-          debugPrint("Error sending group invite: $e");
+          debugPrint('Group message parse error: $e');
         }
         return;
       }
 
-      if (text.startsWith("__FILE__:")) {
-        final raw = text.replaceFirst("__FILE__:", "");
-
+      if (text.startsWith(kPayloadFile)) {
+        final raw = text.replaceFirst(kPayloadFile, '');
         try {
           final data = jsonDecode(raw) as Map<String, dynamic>;
-          final payloadId = data["payloadId"] as int;
-          final fileName = data["fileName"] as String;
-          final kind = (data["kind"] as String?) ?? "file";
-          final groupId = data["groupId"] as String?;
-          final senderNodeId = data["senderNodeId"] as String?;
-          final senderName = data["senderName"] as String?;
+          final payloadId = data['payloadId'] as int;
+          final fileName = data['fileName'] as String;
+          final kind = data['kind'] as String? ?? 'file';
+          final groupId = data['groupId'] as String?;
+          final senderNodeId = data['senderNodeId'] as String?;
+          final senderName = data['senderName'] as String?;
 
           _pendingFileNames[payloadId] = fileName;
           _pendingFileKinds[payloadId] = kind;
@@ -1135,7 +1052,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
             endpointId: endpointId,
           );
         } catch (e) {
-          debugPrint("Error with file metadata: $e");
+          debugPrint('File metadata parse error: $e');
         }
         return;
       }
@@ -1156,20 +1073,71 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     if (payload.type == PayloadType.FILE) {
       final uri = payload.uri;
-      if (uri == null) {
-        debugPrint("Payload FILE fără uri.");
-        return;
-      }
-
+      if (uri == null) return;
       _pendingFileUris[payload.id] = uri;
       _saveReceivedFileIfReady(payloadId: payload.id, endpointId: endpointId);
     }
   }
 
+  Future<void> _saveReceivedFileIfReady({
+    required int payloadId,
+    required String endpointId,
+  }) async {
+    final fileName = _pendingFileNames[payloadId];
+    final fileUri = _pendingFileUris[payloadId];
+    if (fileName == null || fileUri == null) return;
+
+    final dir = await getExternalStorageDirectory();
+    if (dir == null) return;
+
+    final safeName = fileName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final destinationPath = '${dir.path}/$safeName';
+    final copied = await Nearby().copyFileAndDeleteOriginal(
+      fileUri,
+      destinationPath,
+    );
+
+    final device = _devicesByEndpoint[endpointId];
+    final nodeId =
+        _pendingFileSenderNodeIds[payloadId] ?? device?.nodeId ?? endpointId;
+    final displayName =
+        _pendingFileSenderNames[payloadId] ?? device?.displayName ?? endpointId;
+    final kind = _pendingFileKinds[payloadId] ?? 'file';
+    final groupId = _pendingFileGroupIds[payloadId];
+
+    if (copied) {
+      _incomingController.add(
+        NearbyIncomingMessage(
+          endpointId: endpointId,
+          nodeId: nodeId,
+          displayName: displayName,
+          text: kind == 'voice'
+              ? '🎤 Voice message'
+              : '📎 File received: $safeName',
+          type: kind == 'voice'
+              ? NearbyIncomingType.voice
+              : NearbyIncomingType.file,
+          filePath: destinationPath,
+          fileName: safeName,
+          groupId: groupId,
+          senderNodeId: nodeId,
+          senderName: displayName,
+        ),
+      );
+    }
+
+    _pendingFileNames.remove(payloadId);
+    _pendingFileUris.remove(payloadId);
+    _pendingFileKinds.remove(payloadId);
+    _pendingFileGroupIds.remove(payloadId);
+    _pendingFileSenderNodeIds.remove(payloadId);
+    _pendingFileSenderNames.remove(payloadId);
+  }
+
   Future<bool> sendTextToDevice(String nodeId, String text) async {
     final endpointId = _connectedEndpointByNodeId[nodeId];
     if (endpointId == null) {
-      _status = "Device-ul nu este conectat.";
+      _status = 'Device is not connected.';
       notifyListeners();
       return false;
     }
@@ -1181,7 +1149,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       );
       return true;
     } catch (e) {
-      _status = "Eroare trimitere Nearby: $e";
+      _status = 'Send message error: $e';
       notifyListeners();
       return false;
     }
@@ -1194,60 +1162,39 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
       return sendTextToDevice(nodeId, text);
     }
 
-    final alias = _prefs.getString('alias') ?? "MeshChat";
-    final payload = jsonEncode({
-      "scope": "group",
-      "groupId": thread.id,
-      "senderNodeId": _localNodeId,
-      "senderName": alias,
-      "text": text,
-    });
+    final alias = _prefs.getString('alias') ?? 'MeshChat';
+    final payload = {
+      'groupId': thread.id,
+      'groupTitle': thread.title,
+      'text': text,
+      'senderNodeId': _localNodeId,
+      'senderName': alias,
+      'participantNodeIds': thread.participantNodeIds,
+      'participantNames': thread.participantNames,
+    };
 
     var sentAny = false;
 
     for (final nodeId in thread.participantNodeIds) {
+      if (nodeId == _localNodeId) continue;
       final endpointId = _connectedEndpointByNodeId[nodeId];
       if (endpointId == null) continue;
 
       await Nearby().sendBytesPayload(
         endpointId,
-        Uint8List.fromList(utf8.encode("__CHAT__:$payload")),
+        Uint8List.fromList(
+          utf8.encode('$kPayloadGroupMessage${jsonEncode(payload)}'),
+        ),
       );
       sentAny = true;
     }
 
     if (!sentAny) {
-      _status = "No group members are connected.";
+      _status = 'No connected group members.';
       notifyListeners();
     }
+
     return sentAny;
-  }
-
-  Future<String?> sendFileToDevice(String nodeId) async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.any,
-      allowMultiple: false,
-      withData: false,
-    );
-
-    if (result == null || result.files.isEmpty) return null;
-
-    final picked = result.files.single;
-    final path = picked.path;
-
-    if (path == null) {
-      _status = "Could not access the file path.";
-      notifyListeners();
-      return null;
-    }
-
-    return sendPathPayloadToDevice(
-      nodeId: nodeId,
-      path: path,
-      fileName: picked.name,
-      size: picked.size,
-      kind: "file",
-    );
   }
 
   Future<String?> sendPathPayloadToDevice({
@@ -1255,47 +1202,47 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     required String path,
     required String fileName,
     required int size,
-    String kind = "file",
+    String kind = 'file',
     String? groupId,
   }) async {
     final endpointId = _connectedEndpointByNodeId[nodeId];
     if (endpointId == null) {
-      _status = "Device-ul nu este conectat.";
+      _status = 'Device is not connected.';
       notifyListeners();
       return null;
     }
 
     final sourceFile = File(path);
     if (!await sourceFile.exists()) {
-      _status = "Fișierul nu există local.";
+      _status = 'File does not exist locally.';
       notifyListeners();
       return null;
     }
 
     try {
       final payloadId = await Nearby().sendFilePayload(endpointId, path);
-      final alias = _prefs.getString('alias') ?? "MeshChat";
+      final alias = _prefs.getString('alias') ?? 'MeshChat';
 
       final metadata = {
-        "payloadId": payloadId,
-        "fileName": fileName,
-        "size": size,
-        "kind": kind,
-        "groupId": groupId,
-        "senderNodeId": _localNodeId,
-        "senderName": alias,
+        'payloadId': payloadId,
+        'fileName': fileName,
+        'size': size,
+        'kind': kind,
+        'groupId': groupId,
+        'senderNodeId': _localNodeId,
+        'senderName': alias,
       };
 
       await Nearby().sendBytesPayload(
         endpointId,
-        Uint8List.fromList(utf8.encode("__FILE__:${jsonEncode(metadata)}")),
+        Uint8List.fromList(utf8.encode('$kPayloadFile${jsonEncode(metadata)}')),
       );
 
       return path;
     } catch (e) {
-      _status = kind == "voice"
-          ? "Error sending voice message: $e"
-          : "Error sending file: $e";
+      _status = kind == 'voice'
+          ? 'Voice send error: $e'
+          : 'File send error: $e';
       notifyListeners();
       return null;
     }
@@ -1306,7 +1253,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     required String path,
     required String fileName,
     required int size,
-    String kind = "file",
+    String kind = 'file',
   }) async {
     if (!thread.isGroup) {
       final nodeId = thread.deviceId;
@@ -1321,7 +1268,11 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     var sentAny = false;
+
     for (final nodeId in thread.participantNodeIds) {
+      if (nodeId == _localNodeId) continue;
+      if (!isDeviceConnected(nodeId)) continue;
+
       final result = await sendPathPayloadToDevice(
         nodeId: nodeId,
         path: path,
@@ -1338,9 +1289,7 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      start();
-    }
+    if (state == AppLifecycleState.resumed) start();
   }
 
   @override
@@ -1355,7 +1304,9 @@ class NearbyProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 }
 
-// --- APP ENTRY ---
+// -----------------------------------------------------------------------------
+// APP
+// -----------------------------------------------------------------------------
 class MeshChatApp extends StatelessWidget {
   const MeshChatApp({super.key});
 
@@ -1382,7 +1333,6 @@ class MeshChatApp extends StatelessWidget {
   }
 }
 
-// --- NAVIGARE + LISTENER GLOBAL ---
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
 
@@ -1407,17 +1357,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final nearby = Provider.of<NearbyProvider>(context, listen: false);
 
-      _connectionRequestSub = nearby.connectionRequests.listen((request) {
-        _showConnectionRequestDialog(request);
-      });
-
-      _incomingSub = nearby.incomingMessages.listen((incoming) {
-        _saveIncomingMessageDirectly(incoming);
-      });
-
-      _groupInviteSub = nearby.groupInvites.listen((invite) {
-        _showGroupInviteDialog(invite);
-      });
+      _connectionRequestSub = nearby.connectionRequests.listen(
+        _showConnectionRequestDialog,
+      );
+      _incomingSub = nearby.incomingMessages.listen(
+        _saveIncomingMessageDirectly,
+      );
+      _groupInviteSub = nearby.groupInvites.listen(_showGroupInviteDialog);
     });
   }
 
@@ -1456,7 +1402,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       (t) => t.isGroup && t.participantNodeIds.contains(request.nodeId),
     );
 
-    if (!request.isGroupInvite && isKnownGroupPeer) {
+    if (isKnownGroupPeer) {
       await nearby.acceptConnection(request.endpointId);
       return;
     }
@@ -1464,49 +1410,29 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final accept = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: Text(
-            request.isGroupInvite
-                ? "Group Invite"
-                : "Nearby Connection Request",
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Nearby Connection Request'),
+        content: Text('${request.displayName} wants to connect to you.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Reject'),
           ),
-          content: Text(
-            request.isGroupInvite
-                ? "${request.displayName} invites you to the group «${request.groupTitle ?? "MeshChat Group"}»."
-                : "${request.displayName} wants to connect to you.",
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Accept'),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text("Reject"),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text("Accept"),
-            ),
-          ],
-        );
-      },
+        ],
+      ),
     );
 
     if (accept == true) {
       await nearby.acceptConnection(request.endpointId);
       if (!mounted) return;
-
-      if (request.isGroupInvite && request.groupId != null) {
-        settings.createGroupThread(
-          title: request.groupTitle ?? "MeshChat Group",
-          groupId: request.groupId,
-          participantNodeIds: request.participantNodeIds,
-          participantNames: request.participantNames,
-        );
-      } else {
-        settings.getOrCreateThreadForDevice(
-          deviceId: request.nodeId,
-          title: request.displayName,
-        );
-      }
+      settings.getOrCreateThreadForDevice(
+        deviceId: request.nodeId,
+        title: request.displayName,
+      );
     } else {
       await nearby.rejectConnection(request.endpointId);
     }
@@ -1516,44 +1442,50 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     if (!mounted) return;
 
     final settings = Provider.of<SettingsProvider>(context, listen: false);
-    if (settings.threadById(invite.groupId) != null) return;
+    final existing = settings.threadById(invite.groupId);
+
+    if (existing != null) {
+      settings.createOrUpdateGroupThread(
+        groupId: invite.groupId,
+        title: invite.groupTitle,
+        participantNodeIds: invite.participantNodeIds,
+        participantNames: invite.participantNames,
+      );
+      return;
+    }
 
     final accept = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text("Group Invite"),
-          content: Text(
-            "${invite.inviterName} invites you to the group «${invite.groupTitle}».",
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Group Invite'),
+        content: Text(
+          '${invite.inviterName} invites you to “${invite.groupTitle}”.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Reject'),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text("Refuză"),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text("Acceptă"),
-            ),
-          ],
-        );
-      },
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Accept'),
+          ),
+        ],
+      ),
     );
 
     if (accept == true && mounted) {
-      settings.createGroupThread(
-        title: invite.groupTitle,
+      settings.createOrUpdateGroupThread(
         groupId: invite.groupId,
+        title: invite.groupTitle,
         participantNodeIds: invite.participantNodeIds,
         participantNames: invite.participantNames,
       );
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text("Te-ai alăturat grupului ${invite.groupTitle}."),
-        ),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Joined ${invite.groupTitle}.')));
     }
   }
 
@@ -1568,10 +1500,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       isMine: false,
       timestamp: DateTime.now(),
       type: incoming.type == NearbyIncomingType.voice
-          ? "voice"
+          ? 'voice'
           : incoming.type == NearbyIncomingType.file
-          ? "file"
-          : "text",
+          ? 'file'
+          : 'text',
       fileName: incoming.fileName,
       filePath: incoming.filePath,
       senderNodeId: incoming.senderNodeId ?? incoming.nodeId,
@@ -1579,18 +1511,27 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     );
 
     if (incoming.groupId != null) {
-      final existing = settings.threadById(incoming.groupId!);
+      if (incoming.groupParticipantNodeIds != null &&
+          incoming.groupParticipantNames != null) {
+        settings.createOrUpdateGroupThread(
+          groupId: incoming.groupId!,
+          title: incoming.groupTitle ?? 'MeshChat Group',
+          participantNodeIds: incoming.groupParticipantNodeIds!,
+          participantNames: incoming.groupParticipantNames!,
+        );
+      }
+
       final thread =
-          existing ??
-          settings.createGroupThread(
-            title: "Grup MeshChat",
+          settings.threadById(incoming.groupId!) ??
+          settings.createOrUpdateGroupThread(
             groupId: incoming.groupId!,
+            title: incoming.groupTitle ?? 'MeshChat Group',
             participantNodeIds: [incoming.nodeId],
             participantNames: {incoming.nodeId: incoming.displayName},
           );
       settings.addMessageToThreadId(thread.id, msg);
     } else {
-      settings.addIncomingMessage(
+      settings.addIncomingDirectMessage(
         deviceId: incoming.nodeId,
         title: incoming.displayName,
         message: msg,
@@ -1598,15 +1539,15 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     }
 
     final notificationBody = incoming.type == NearbyIncomingType.voice
-        ? "Mesaj vocal nou"
+        ? 'New voice message'
         : incoming.type == NearbyIncomingType.file
-        ? "Fișier primit: ${incoming.fileName ?? "fișier"}"
+        ? 'File received: ${incoming.fileName ?? 'file'}'
         : incoming.text;
 
     if (!_isAppInForeground && settings.notificationsEnabled) {
       AppNotifications.showMessage(
         title: incoming.groupId != null
-            ? "${incoming.senderName ?? incoming.displayName} în grup"
+            ? '${incoming.senderName ?? incoming.displayName} in group'
             : incoming.displayName,
         body: notificationBody,
       );
@@ -1617,10 +1558,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       SnackBar(
         content: Text(
           incoming.type == NearbyIncomingType.voice
-              ? "Mesaj vocal nou de la ${incoming.senderName ?? incoming.displayName}"
+              ? 'New voice message from ${incoming.senderName ?? incoming.displayName}'
               : incoming.type == NearbyIncomingType.file
-              ? "Fișier primit de la ${incoming.senderName ?? incoming.displayName}: ${incoming.fileName ?? "fișier"}"
-              : "Mesaj nou de la ${incoming.senderName ?? incoming.displayName}",
+              ? 'File from ${incoming.senderName ?? incoming.displayName}: ${incoming.fileName ?? 'file'}'
+              : 'New message from ${incoming.senderName ?? incoming.displayName}',
         ),
       ),
     );
@@ -1660,7 +1601,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   }
 }
 
-// --- CHAT LIST ---
+// -----------------------------------------------------------------------------
+// CHAT LIST
+// -----------------------------------------------------------------------------
 class ChatListPage extends StatelessWidget {
   final VoidCallback onNewChatPressed;
 
@@ -1709,7 +1652,7 @@ class ChatListPage extends StatelessWidget {
                   child: settings.threads.isEmpty
                       ? const Center(
                           child: Text(
-                            "No chats available.This app is in development,please report all the bugs via my github and enjoy!",
+                            'No chats available. Connect to a device from Scan.',
                             textAlign: TextAlign.center,
                           ),
                         )
@@ -1718,12 +1661,12 @@ class ChatListPage extends StatelessWidget {
                           itemBuilder: (context, i) {
                             final t = settings.threads[i];
                             final online = t.isGroup
-                                ? t.participantNodeIds.any(
-                                    nearby.isDeviceOnline,
-                                  )
+                                ? t.participantNodeIds
+                                      .where((id) => id != nearby.localNodeId)
+                                      .any(nearby.isDeviceOnline)
                                 : nearby.isDeviceOnline(t.deviceId);
                             final connected = t.isGroup
-                                ? nearby.activeCountForThread(t) > 0
+                                ? nearby.connectedOtherCountForGroup(t) > 0
                                 : nearby.isDeviceConnected(t.deviceId);
 
                             return ListTile(
@@ -1765,10 +1708,10 @@ class ChatListPage extends StatelessWidget {
                                 t.messages.isNotEmpty
                                     ? t.messages.last.text
                                     : t.isGroup
-                                    ? "Group"
+                                    ? 'Group'
                                     : online
-                                    ? "Online"
-                                    : "Offline",
+                                    ? 'Online'
+                                    : 'Offline',
                                 maxLines: 1,
                               ),
                               trailing: Row(
@@ -1776,12 +1719,12 @@ class ChatListPage extends StatelessWidget {
                                 children: [
                                   Text(
                                     t.isGroup
-                                        ? "${nearby.activeCountForThread(t)} active"
+                                        ? '${nearby.activeCountForThread(t)} active'
                                         : connected
-                                        ? "Connected"
+                                        ? 'Connected'
                                         : online
-                                        ? "Online"
-                                        : "Offline",
+                                        ? 'Online'
+                                        : 'Offline',
                                     style: TextStyle(
                                       color: connected
                                           ? Colors.green
@@ -1793,14 +1736,14 @@ class ChatListPage extends StatelessWidget {
                                   ),
                                   PopupMenuButton<String>(
                                     onSelected: (value) {
-                                      if (value == "delete") {
+                                      if (value == 'delete') {
                                         settings.deleteThread(t.id);
                                       }
                                     },
                                     itemBuilder: (_) => const [
                                       PopupMenuItem(
-                                        value: "delete",
-                                        child: Text("Delete conversation"),
+                                        value: 'delete',
+                                        child: Text('Delete conversation'),
                                       ),
                                     ],
                                   ),
@@ -1841,16 +1784,30 @@ class ChatListPage extends StatelessWidget {
   }
 }
 
-// --- NEARBY SCAN PAGE ---
+// -----------------------------------------------------------------------------
+// SCAN PAGE
+// -----------------------------------------------------------------------------
 class NearbyScannerPage extends StatelessWidget {
   const NearbyScannerPage({super.key});
 
   Future<void> _showCreateGroupDialog(BuildContext context) async {
     final nearby = Provider.of<NearbyProvider>(context, listen: false);
     final settings = Provider.of<SettingsProvider>(context, listen: false);
-    final devices = nearby.onlineGroupCandidates();
+    final devices = nearby.connectedDevices;
+
+    if (devices.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Connect to at least one device before creating a group.',
+          ),
+        ),
+      );
+      return;
+    }
+
     final selected = <String>{};
-    final titleController = TextEditingController(text: "MeshChat Group");
+    final titleController = TextEditingController(text: 'MeshChat Group');
 
     final create = await showDialog<bool>(
       context: context,
@@ -1858,7 +1815,7 @@ class NearbyScannerPage extends StatelessWidget {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             return AlertDialog(
-              title: const Text("Create Group"),
+              title: const Text('Create Group'),
               content: SizedBox(
                 width: double.maxFinite,
                 child: Column(
@@ -1867,7 +1824,7 @@ class NearbyScannerPage extends StatelessWidget {
                     TextField(
                       controller: titleController,
                       decoration: const InputDecoration(
-                        labelText: "Group Name",
+                        labelText: 'Group Name',
                         border: OutlineInputBorder(),
                       ),
                     ),
@@ -1878,7 +1835,6 @@ class NearbyScannerPage extends StatelessWidget {
                         itemCount: devices.length,
                         itemBuilder: (_, i) {
                           final d = devices[i];
-                          final connected = nearby.isDeviceConnected(d.nodeId);
                           return CheckboxListTile(
                             value: selected.contains(d.nodeId),
                             onChanged: (v) {
@@ -1891,11 +1847,7 @@ class NearbyScannerPage extends StatelessWidget {
                               });
                             },
                             title: Text(d.displayName),
-                            subtitle: Text(
-                              connected
-                                  ? "Connected"
-                                  : "Online - requires connection",
-                            ),
+                            subtitle: const Text('Connected'),
                           );
                         },
                       ),
@@ -1906,13 +1858,13 @@ class NearbyScannerPage extends StatelessWidget {
               actions: [
                 TextButton(
                   onPressed: () => Navigator.pop(dialogContext, false),
-                  child: const Text("Cancel"),
+                  child: const Text('Cancel'),
                 ),
                 FilledButton(
                   onPressed: selected.isEmpty
                       ? null
                       : () => Navigator.pop(dialogContext, true),
-                  child: const Text("Create"),
+                  child: const Text('Create'),
                 ),
               ],
             );
@@ -1922,14 +1874,16 @@ class NearbyScannerPage extends StatelessWidget {
     );
 
     if (create == true) {
-      final names = <String, String>{};
+      final names = <String, String>{nearby.localNodeId: settings.alias};
       for (final d in devices.where((d) => selected.contains(d.nodeId))) {
         names[d.nodeId] = d.displayName;
       }
 
+      final participants = <String>{nearby.localNodeId, ...selected}.toList();
+
       final thread = settings.createGroupThread(
         title: titleController.text,
-        participantNodeIds: selected.toList(),
+        participantNodeIds: participants,
         participantNames: names,
       );
 
@@ -1940,7 +1894,7 @@ class NearbyScannerPage extends StatelessWidget {
 
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Invites sent for ${thread.title}.")),
+          SnackBar(content: Text('Group created: ${thread.title}.')),
         );
       }
     }
@@ -1956,7 +1910,7 @@ class NearbyScannerPage extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Nearby Scan"),
+        title: const Text('Nearby Scan'),
         actions: [
           IconButton(
             onPressed: nearby.restartNearby,
@@ -1978,9 +1932,9 @@ class NearbyScannerPage extends StatelessWidget {
                       ? Colors.green
                       : Colors.orange,
                 ),
-                title: Text("My name: ${settings.alias}"),
+                title: Text('My name: ${settings.alias}'),
                 subtitle: Text(
-                  "${nearby.status}\nID permanent: ${nearby.localNodeId}",
+                  '${nearby.status}\nPermanent ID: ${nearby.localNodeId}',
                 ),
                 isThreeLine: true,
               ),
@@ -1993,8 +1947,8 @@ class NearbyScannerPage extends StatelessWidget {
                     onPressed: nearby.startAdvertising,
                     child: Text(
                       nearby.isAdvertising
-                          ? "Advertising ON"
-                          : "Start Advertising",
+                          ? 'Advertising ON'
+                          : 'Start Advertising',
                     ),
                   ),
                 ),
@@ -2003,7 +1957,7 @@ class NearbyScannerPage extends StatelessWidget {
                   child: ElevatedButton(
                     onPressed: nearby.startDiscovery,
                     child: Text(
-                      nearby.isDiscovering ? "Discovery ON" : "Start Discovery",
+                      nearby.isDiscovering ? 'Discovery ON' : 'Start Discovery',
                     ),
                   ),
                 ),
@@ -2013,11 +1967,9 @@ class NearbyScannerPage extends StatelessWidget {
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
-                onPressed: entries.isEmpty
-                    ? null
-                    : () => _showCreateGroupDialog(context),
+                onPressed: () => _showCreateGroupDialog(context),
                 icon: const Icon(Icons.group_add),
-                label: const Text("Create Group"),
+                label: const Text('Create Group from connected devices'),
               ),
             ),
             const SizedBox(height: 12),
@@ -2025,7 +1977,7 @@ class NearbyScannerPage extends StatelessWidget {
               child: entries.isEmpty
                   ? const Center(
                       child: Text(
-                        "No Nearby devices found yet.\nRun the app on two real Android phones.",
+                        'No Nearby devices found yet.\nRun the app on two real Android phones.',
                         textAlign: TextAlign.center,
                       ),
                     )
@@ -2046,7 +1998,7 @@ class NearbyScannerPage extends StatelessWidget {
                               color: isConnected ? Colors.green : null,
                             ),
                             title: Text(device.displayName),
-                            subtitle: Text("Node ID: ${device.nodeId}"),
+                            subtitle: Text('Node ID: ${device.nodeId}'),
                             trailing: ElevatedButton(
                               onPressed: isConnected
                                   ? null
@@ -2060,7 +2012,7 @@ class NearbyScannerPage extends StatelessWidget {
                                       );
                                     },
                               child: Text(
-                                isConnected ? "Connected" : "Connect",
+                                isConnected ? 'Connected' : 'Connect',
                               ),
                             ),
                             onTap: () {
@@ -2090,7 +2042,9 @@ class NearbyScannerPage extends StatelessWidget {
   }
 }
 
-// --- CHAT ROOM ---
+// -----------------------------------------------------------------------------
+// CHAT ROOM
+// -----------------------------------------------------------------------------
 class ModernChatRoom extends StatefulWidget {
   final String threadId;
 
@@ -2106,12 +2060,10 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
   final AudioRecorder _audioRecorder = AudioRecorder();
 
   bool _isRecordingVoice = false;
-  String? _recordingPath;
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
-
       _scrollController.animateTo(
         _scrollController.position.maxScrollExtent,
         duration: const Duration(milliseconds: 300),
@@ -2123,53 +2075,50 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
   bool _isImageFile(String? fileName) {
     if (fileName == null) return false;
     final lower = fileName.toLowerCase();
-
-    return lower.endsWith(".jpg") ||
-        lower.endsWith(".jpeg") ||
-        lower.endsWith(".png") ||
-        lower.endsWith(".gif") ||
-        lower.endsWith(".webp") ||
-        lower.endsWith(".bmp");
+    return lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.png') ||
+        lower.endsWith('.gif') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.bmp');
   }
 
   bool _isVideoFile(String? fileName) {
     if (fileName == null) return false;
     final lower = fileName.toLowerCase();
-
-    return lower.endsWith(".mp4") ||
-        lower.endsWith(".mov") ||
-        lower.endsWith(".mkv") ||
-        lower.endsWith(".webm") ||
-        lower.endsWith(".avi");
+    return lower.endsWith('.mp4') ||
+        lower.endsWith('.mov') ||
+        lower.endsWith('.mkv') ||
+        lower.endsWith('.webm') ||
+        lower.endsWith('.avi');
   }
 
   bool _isAudioFile(String? fileName) {
     if (fileName == null) return false;
     final lower = fileName.toLowerCase();
-
-    return lower.endsWith(".m4a") ||
-        lower.endsWith(".aac") ||
-        lower.endsWith(".mp3") ||
-        lower.endsWith(".wav") ||
-        lower.endsWith(".ogg") ||
-        lower.endsWith(".opus");
+    return lower.endsWith('.m4a') ||
+        lower.endsWith('.aac') ||
+        lower.endsWith('.mp3') ||
+        lower.endsWith('.wav') ||
+        lower.endsWith('.ogg') ||
+        lower.endsWith('.opus');
   }
 
   Future<void> _openFile(ChatMessage message) async {
     final path = message.filePath;
-
     if (path == null || path.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Nu am cale pentru fișier.")),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('No file path available.')));
       return;
     }
 
     final file = File(path);
-
     if (!await file.exists()) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Fișierul nu mai există pe dispozitiv.")),
+        const SnackBar(
+          content: Text('The file no longer exists on this device.'),
+        ),
       );
       return;
     }
@@ -2179,47 +2128,33 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
   Future<void> _downloadFile(ChatMessage message) async {
     final sourcePath = message.filePath;
-    final fileName = message.fileName ?? "meshup_file";
+    final fileName = message.fileName ?? 'meshchat_file';
 
-    if (sourcePath == null || sourcePath.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Nu am cale pentru fișier.")),
-      );
-      return;
-    }
-
+    if (sourcePath == null || sourcePath.isEmpty) return;
     final sourceFile = File(sourcePath);
-
-    if (!await sourceFile.exists()) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Fișierul nu mai există pe dispozitiv.")),
-      );
-      return;
-    }
+    if (!await sourceFile.exists()) return;
 
     try {
       final bytes = await sourceFile.readAsBytes();
-
       final savedPath = await FilePicker.platform.saveFile(
-        dialogTitle: "Salvează fișierul",
+        dialogTitle: 'Save file',
         fileName: fileName,
         bytes: bytes,
       );
 
       if (savedPath == null) return;
-
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text("Fișier salvat: $fileName")));
+      ).showSnackBar(SnackBar(content: Text('File saved: $fileName')));
     } catch (e) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text("Eroare la salvare: $e")));
+      ).showSnackBar(SnackBar(content: Text('Save error: $e')));
     }
   }
 
   Widget _buildFileBubble(ChatMessage message) {
-    final fileName = message.fileName ?? "Fișier";
+    final fileName = message.fileName ?? 'File';
     final filePath = message.filePath;
     final fileExists = filePath != null && File(filePath).existsSync();
 
@@ -2270,7 +2205,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
             ),
           const SizedBox(height: 8),
           Text(
-            message.isVoice ? "Mesaj vocal" : fileName,
+            message.isVoice ? 'Voice message' : fileName,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
@@ -2286,7 +2221,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                   onPressed: fileExists ? () => _openFile(message) : null,
                   icon: const Icon(Icons.play_arrow_rounded, size: 18),
                   label: Text(
-                    message.isVoice || audioPreview ? "Play" : "Open",
+                    message.isVoice || audioPreview ? 'Play' : 'Open',
                   ),
                 ),
               ),
@@ -2295,7 +2230,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                 child: FilledButton.tonalIcon(
                   onPressed: fileExists ? () => _downloadFile(message) : null,
                   icon: const Icon(Icons.file_download_outlined, size: 18),
-                  label: const Text("Save"),
+                  label: const Text('Save'),
                 ),
               ),
             ],
@@ -2304,7 +2239,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Text(
-                "Fișier indisponibil local",
+                'File unavailable locally',
                 style: TextStyle(
                   fontSize: 12,
                   color: message.isMine ? Colors.white70 : Colors.red,
@@ -2320,9 +2255,9 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     final nearby = Provider.of<NearbyProvider>(context, listen: false);
     final settings = Provider.of<SettingsProvider>(context, listen: false);
 
-    if (thread.isGroup && nearby.activeCountForThread(thread) == 0) {
+    if (thread.isGroup && nearby.connectedOtherCountForGroup(thread) == 0) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Nu există membri conectați în grup.")),
+        const SnackBar(content: Text('No other connected group members.')),
       );
       return;
     }
@@ -2330,7 +2265,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     if (!thread.isGroup && !nearby.isDeviceConnected(thread.deviceId)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("Conectează-te la device înainte să trimiți fișiere."),
+          content: Text('Connect to the device before sending files.'),
         ),
       );
       return;
@@ -2343,7 +2278,6 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     );
 
     if (result == null || result.files.isEmpty) return;
-
     final picked = result.files.single;
     final path = picked.path;
     if (path == null) return;
@@ -2353,15 +2287,13 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
       path: path,
       fileName: picked.name,
       size: picked.size,
-      kind: "file",
+      kind: 'file',
     );
 
     if (sentPath == null) {
-      if (nearby.status.isNotEmpty) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(nearby.status)));
-      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(nearby.status)));
       return;
     }
 
@@ -2369,10 +2301,10 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
       thread.id,
       ChatMessage(
         id: const Uuid().v4(),
-        text: "📎 Fișier trimis: ${picked.name}",
+        text: '📎 File sent: ${picked.name}',
         isMine: true,
         timestamp: DateTime.now(),
-        type: "file",
+        type: 'file',
         fileName: picked.name,
         filePath: sentPath,
       ),
@@ -2392,9 +2324,9 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
   Future<void> _startVoiceRecording(ChatThread thread) async {
     final nearby = Provider.of<NearbyProvider>(context, listen: false);
 
-    if (thread.isGroup && nearby.activeCountForThread(thread) == 0) {
+    if (thread.isGroup && nearby.connectedOtherCountForGroup(thread) == 0) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Nu există membri conectați în grup.")),
+        const SnackBar(content: Text('No other connected group members.')),
       );
       return;
     }
@@ -2402,7 +2334,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     if (!thread.isGroup && !nearby.isDeviceConnected(thread.deviceId)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("Connect to the device before sending voice messages."),
+          content: Text('Connect to the device before sending voice messages.'),
         ),
       );
       return;
@@ -2411,42 +2343,28 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     final micOk = await requestMicrophonePermission();
     if (!micOk) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Microphone permission is required for voice messages.",
-          ),
-        ),
+        const SnackBar(content: Text('Microphone permission is required.')),
       );
       return;
     }
 
     final hasRecorderPermission = await _audioRecorder.hasPermission();
-    if (!hasRecorderPermission) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("The app does not have access to the microphone."),
-        ),
-      );
-      return;
-    }
+    if (!hasRecorderPermission) return;
 
     final dir = await getTemporaryDirectory();
-    final fileName = "voice_${DateTime.now().millisecondsSinceEpoch}.m4a";
-    final path = "${dir.path}/$fileName";
+    final fileName = 'voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    final path = '${dir.path}/$fileName';
 
     await _audioRecorder.start(
       const RecordConfig(encoder: AudioEncoder.aacLc),
       path: path,
     );
 
-    setState(() {
-      _isRecordingVoice = true;
-      _recordingPath = path;
-    });
+    setState(() => _isRecordingVoice = true);
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text("Recording started. Tap the microphone again to send."),
+        content: Text('Recording started. Tap the microphone again to send.'),
       ),
     );
   }
@@ -2455,28 +2373,12 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     final nearby = Provider.of<NearbyProvider>(context, listen: false);
     final settings = Provider.of<SettingsProvider>(context, listen: false);
 
-    final stoppedPath = await _audioRecorder.stop();
+    final path = await _audioRecorder.stop();
+    setState(() => _isRecordingVoice = false);
 
-    setState(() {
-      _isRecordingVoice = false;
-      _recordingPath = null;
-    });
-
-    final path = stoppedPath;
-    if (path == null || path.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Înregistrarea nu a fost salvată.")),
-      );
-      return;
-    }
-
+    if (path == null || path.isEmpty) return;
     final file = File(path);
-    if (!await file.exists()) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Fișierul audio nu există local.")),
-      );
-      return;
-    }
+    if (!await file.exists()) return;
 
     final fileName = path.split(Platform.pathSeparator).last;
     final sentPath = await nearby.sendPathPayloadToThread(
@@ -2484,7 +2386,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
       path: path,
       fileName: fileName,
       size: await file.length(),
-      kind: "voice",
+      kind: 'voice',
     );
 
     if (sentPath == null) {
@@ -2498,10 +2400,10 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
       thread.id,
       ChatMessage(
         id: const Uuid().v4(),
-        text: "🎤 Mesaj vocal",
+        text: '🎤 Voice message',
         isMine: true,
         timestamp: DateTime.now(),
-        type: "voice",
+        type: 'voice',
         fileName: fileName,
         filePath: sentPath,
       ),
@@ -2544,9 +2446,9 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
-        title: Text("Membri activi (${names.length})"),
+        title: Text('Active members (${names.length})'),
         content: names.isEmpty
-            ? const Text("Niciun membru conectat momentan.")
+            ? const Text('No members connected right now.')
             : Column(
                 mainAxisSize: MainAxisSize.min,
                 children: names
@@ -2561,7 +2463,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: const Text("OK"),
+            child: const Text('OK'),
           ),
         ],
       ),
@@ -2573,14 +2475,13 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
     NearbyProvider nearby,
     SettingsProvider settings,
   ) async {
-    final candidates = nearby
-        .onlineGroupCandidates()
+    final candidates = nearby.connectedDevices
         .where((d) => !thread.participantNodeIds.contains(d.nodeId))
         .toList();
 
     if (candidates.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("No new online devices to add.")),
+        const SnackBar(content: Text('No new connected devices to add.')),
       );
       return;
     }
@@ -2593,7 +2494,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             return AlertDialog(
-              title: const Text("Add members"),
+              title: const Text('Add members'),
               content: SizedBox(
                 width: double.maxFinite,
                 child: ListView.builder(
@@ -2613,11 +2514,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                         });
                       },
                       title: Text(d.displayName),
-                      subtitle: Text(
-                        nearby.isDeviceConnected(d.nodeId)
-                            ? "Connected"
-                            : "Online - requires connection",
-                      ),
+                      subtitle: const Text('Connected'),
                     );
                   },
                 ),
@@ -2625,13 +2522,13 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
               actions: [
                 TextButton(
                   onPressed: () => Navigator.pop(dialogContext, false),
-                  child: const Text("Cancel"),
+                  child: const Text('Cancel'),
                 ),
                 FilledButton(
                   onPressed: selected.isEmpty
                       ? null
                       : () => Navigator.pop(dialogContext, true),
-                  child: const Text("Add"),
+                  child: const Text('Add'),
                 ),
               ],
             );
@@ -2650,14 +2547,23 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
       settings.saveThread(thread);
 
+      final updateTargets = thread.participantNodeIds
+          .where((id) => id != nearby.localNodeId)
+          .where(nearby.isDeviceConnected)
+          .toList();
+
       await nearby.sendGroupInvite(
         groupThread: thread,
-        targetNodeIds: selected.toList(),
+        targetNodeIds: updateTargets,
       );
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Invites sent to ${selected.length} members.")),
+        SnackBar(
+          content: Text(
+            'Group updated. Sent to ${updateTargets.length} connected members.',
+          ),
+        ),
       );
     }
   }
@@ -2678,17 +2584,19 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
 
     if (thread == null) {
       return Scaffold(
-        appBar: AppBar(title: const Text("Chat")),
-        body: const Center(child: Text("The conversation no longer exists.")),
+        appBar: AppBar(title: const Text('Chat')),
+        body: const Center(child: Text('The conversation no longer exists.')),
       );
     }
 
     final nodeId = thread.deviceId;
     final online = thread.isGroup
-        ? thread.participantNodeIds.any(nearby.isDeviceOnline)
+        ? thread.participantNodeIds
+              .where((id) => id != nearby.localNodeId)
+              .any(nearby.isDeviceOnline)
         : nearby.isDeviceOnline(nodeId);
     final connected = thread.isGroup
-        ? nearby.activeCountForThread(thread) > 0
+        ? nearby.connectedOtherCountForGroup(thread) > 0
         : nearby.isDeviceConnected(nodeId);
 
     return Scaffold(
@@ -2699,12 +2607,12 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
             Text(thread.title),
             Text(
               thread.isGroup
-                  ? "${nearby.activeCountForThread(thread)} active people"
+                  ? '${nearby.activeCountForThread(thread)} active members'
                   : connected
-                  ? "Connected Nearby"
+                  ? 'Connected Nearby'
                   : online
-                  ? "Online, not connected"
-                  : "Offline",
+                  ? 'Online, not connected'
+                  : 'Offline',
               style: TextStyle(
                 fontSize: 12,
                 color: connected
@@ -2719,7 +2627,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
         actions: [
           if (thread.isGroup)
             IconButton(
-              tooltip: "Add members",
+              tooltip: 'Add connected members',
               onPressed: () => _showAddMembersDialog(thread, nearby, settings),
               icon: const Icon(Icons.person_add),
             ),
@@ -2727,13 +2635,13 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
             TextButton.icon(
               onPressed: () => nearby.connectThreadDevices(thread),
               icon: const Icon(Icons.link),
-              label: const Text("Connect"),
+              label: const Text('Connect'),
             ),
           if (thread.isGroup)
             TextButton.icon(
               onPressed: () => _showActiveMembers(thread, nearby),
               icon: const Icon(Icons.group),
-              label: Text("${nearby.activeCountForThread(thread)} active"),
+              label: Text('${nearby.activeCountForThread(thread)} active'),
             ),
           if (!thread.isGroup && nodeId != null)
             TextButton.icon(
@@ -2743,7 +2651,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                   ? () => nearby.connectToDevice(nodeId)
                   : null,
               icon: Icon(connected ? Icons.link_off : Icons.link),
-              label: Text(connected ? "Disconnect" : "Connect"),
+              label: Text(connected ? 'Disconnect' : 'Connect'),
             ),
         ],
       ),
@@ -2759,19 +2667,19 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                 : Colors.grey.withOpacity(0.15),
             child: Text(
               thread.isGroup
-                  ? "Group: ${nearby.activeCountForThread(thread)} connected members. Press Connect to reconnect online members."
+                  ? 'Groups use normal peer-to-peer connections. Add/create groups only from connected devices.'
                   : connected
-                  ? "Nearby ready: messages and files are sent to the connected device."
+                  ? 'Nearby ready: messages and files are sent to the connected device.'
                   : online
-                  ? "Device online. Press Connect to resume the conversation."
-                  : "Device offline or not detected at the moment.",
+                  ? 'Device online. Press Connect to resume the conversation.'
+                  : 'Device offline or not detected right now.',
               textAlign: TextAlign.center,
               style: const TextStyle(fontSize: 12),
             ),
           ),
           Expanded(
             child: thread.messages.isEmpty
-                ? const Center(child: Text("No messages yet."))
+                ? const Center(child: Text('No messages yet.'))
                 : ListView.builder(
                     controller: _scrollController,
                     itemCount: thread.messages.length,
@@ -2808,11 +2716,9 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                                           style: TextStyle(
                                             fontSize: 11,
                                             fontWeight: FontWeight.bold,
-                                            color: message.isMine
-                                                ? Colors.white70
-                                                : Theme.of(
-                                                    context,
-                                                  ).colorScheme.primary,
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.primary,
                                           ),
                                         ),
                                       ),
@@ -2840,7 +2746,7 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
                     child: TextField(
                       controller: _msgController,
                       decoration: const InputDecoration(
-                        hintText: "Mesaj...",
+                        hintText: 'Message...',
                         border: OutlineInputBorder(),
                       ),
                       onSubmitted: (_) => _send(thread),
@@ -2871,7 +2777,9 @@ class _ModernChatRoomState extends State<ModernChatRoom> {
   }
 }
 
-// --- SETTINGS ---
+// -----------------------------------------------------------------------------
+// SETTINGS PAGE
+// -----------------------------------------------------------------------------
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
 
@@ -2885,7 +2793,6 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
-
     final settings = Provider.of<SettingsProvider>(context, listen: false);
     _aliasController = TextEditingController(text: settings.alias);
   }
@@ -2913,7 +2820,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             title: const Text('My Device'),
             subtitle: Text(
-              "${settings.alias} • ID permanent: ${nearby.localNodeId}",
+              '${settings.alias} • Permanent ID: ${nearby.localNodeId}',
             ),
           ),
           Card(
@@ -2923,15 +2830,15 @@ class _SettingsPageState extends State<SettingsPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    "Alias Nearby",
+                    'Nearby Alias',
                     style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
                   TextField(
                     controller: _aliasController,
                     decoration: const InputDecoration(
-                      labelText: "Numele meu",
-                      hintText: "Ex: User, Telefonul meu",
+                      labelText: 'My name',
+                      hintText: 'Example: Alex, My Phone',
                       border: OutlineInputBorder(),
                     ),
                     onSubmitted: (value) async {
@@ -2941,7 +2848,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       if (!context.mounted) return;
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(
-                          content: Text("Alias saved and Nearby restarted."),
+                          content: Text('Alias saved and Nearby restarted.'),
                         ),
                       );
                     },
@@ -2957,16 +2864,16 @@ class _SettingsPageState extends State<SettingsPage> {
                         if (!context.mounted) return;
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(
-                            content: Text("Alias saved and Nearby restarted."),
+                            content: Text('Alias saved and Nearby restarted.'),
                           ),
                         );
                       },
-                      child: const Text("Save Alias"),
+                      child: const Text('Save Alias'),
                     ),
                   ),
                   const SizedBox(height: 4),
                   const Text(
-                    "The name remains saved. The permanent ID does not change on restart, so conversations can be resumed when the device comes online.",
+                    'The name remains saved. The permanent ID does not change on restart, so conversations can be resumed when the device comes online.',
                     style: TextStyle(fontSize: 12),
                   ),
                 ],
@@ -2974,25 +2881,25 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           SwitchListTile(
-            title: const Text("Save History"),
+            title: const Text('Save History'),
             value: settings.saveHistory,
             onChanged: (v) => settings.toggleSaveHistory(v),
           ),
           SwitchListTile(
-            title: const Text("Notifications"),
+            title: const Text('Notifications'),
             subtitle: const Text(
-              "You will only receive notifications when the app is not open.",
+              'You will only receive notifications when the app is not open.',
             ),
             value: settings.notificationsEnabled,
             onChanged: (v) => settings.toggleNotifications(v),
           ),
           ListTile(
             leading: const Icon(Icons.delete, color: Colors.red),
-            title: const Text("Clear Chats"),
+            title: const Text('Clear Chats'),
             onTap: () => settings.clearChats(),
           ),
           SwitchListTile(
-            title: const Text("Dark Mode"),
+            title: const Text('Dark Mode'),
             value: settings.isDarkMode,
             onChanged: (v) => settings.toggleTheme(v),
           ),
